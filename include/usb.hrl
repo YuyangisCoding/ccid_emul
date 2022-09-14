@@ -258,10 +258,10 @@
     bMaxCCIDBusySlots :: integer()
     }).
 
--record(ccid_bulk, {
-    type :: integer(),
+-record(ccid_generic_msg, {
     slot :: integer(),
     seq :: integer(),
+    type :: integer(),
     params = <<0:24>> :: binary(),
     data = <<>> :: binary()
     }).
@@ -269,5 +269,149 @@
 -record(ccid_err, {
     icc = active :: active | inactive | not_present,
     cmd = ok :: ok | failed | time_ext,
-    error :: integer()
+    error = 0 :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_iccpoweron, {
+    slot :: integer(),
+    seq :: integer(),
+    powersel :: auto | '5v' | '3v' | '1.8v'
+    }).
+
+-record(ccid_pc_to_rdr_iccpoweroff, {
+    slot :: integer(),
+    seq :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_getslotstatus, {
+    slot :: integer(),
+    seq :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_xfrblock, {
+    slot :: integer(),
+    seq :: integer(),
+    bwi = 0 :: integer(),
+    chain = one :: one | first | last | continue | get_next,
+    data :: binary()
+    }).
+
+-record(ccid_pc_to_rdr_getparams, {
+    slot :: integer(),
+    seq :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_resetparams, {
+    slot :: integer(),
+    seq :: integer()
+    }).
+
+-record(ccid_t0_params, {
+    fidx = 1 :: integer(),
+    didx = 1 :: integer(),
+    convention = direct :: direct | inverse,
+    guardtime = 0 :: integer(),
+    wi = 0 :: integer(),
+    clockstop = [high, low] :: [high | low]
+    }).
+
+-record(ccid_t1_params, {
+    fidx = 1 :: integer(),
+    didx = 1 :: integer(),
+    checksum = lrc :: lrc | crc,
+    convention = direct :: direct | inverse,
+    guardtime = 0 :: integer(),
+    bwi = 0 :: integer(),
+    cwi = 0 :: integer(),
+    clockstop = [high, low] :: [high | low],
+    ifsc = 16#fe :: integer(),
+    nad = 0 :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_setparams, {
+    slot :: integer(),
+    seq :: integer(),
+    params :: #ccid_t0_params{} | #ccid_t1_params{}
+    }).
+
+-record(ccid_pc_to_rdr_escape, {
+    slot :: integer(),
+    seq :: integer(),
+    data :: binary()
+    }).
+
+-record(ccid_pc_to_rdr_iccclock, {
+    slot :: integer(),
+    seq :: integer(),
+    cmd = restart :: restart | stop
+    }).
+
+-record(ccid_pc_to_rdr_t0apdu, {
+    slot :: integer(),
+    seq :: integer(),
+    cls_get_response :: default | echo | integer(),
+    cls_envelope :: default | echo | integer()
+    }).
+
+-record(ccid_pc_to_rdr_mechanical, {
+    slot :: integer(),
+    seq :: integer(),
+    func :: accept | eject | capture | lock | unlock
+    }).
+
+-record(ccid_pc_to_rdr_abort, {
+    slot :: integer(),
+    seq :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_setbaudclock, {
+    slot :: integer(),
+    seq :: integer(),
+    freq :: integer(),
+    baud :: integer()
+    }).
+
+-record(ccid_rdr_to_pc_datablock, {
+    slot :: integer(),
+    seq :: integer(),
+    err = #ccid_err{} :: #ccid_err{},
+    chain = one :: one | first | last | continue | get_next,
+    data :: binary()
+    }).
+
+-record(ccid_rdr_to_pc_slotstatus, {
+    slot :: integer(),
+    seq :: integer(),
+    err = #ccid_err{} :: #ccid_err{},
+    clock = stopped :: running | stopped_low | stopped_high | stopped
+    }).
+
+-record(ccid_rdr_to_pc_params, {
+    slot :: integer(),
+    seq :: integer(),
+    err = #ccid_err{} :: #ccid_err{},
+    params :: none | #ccid_t0_params{} | #ccid_t1_params{}
+    }).
+
+-record(ccid_rdr_to_pc_escape, {
+    slot :: integer(),
+    seq :: integer(),
+    err = #ccid_err{} :: #ccid_err{},
+    data :: binary()
+    }).
+
+-record(ccid_rdr_to_pc_baudclock, {
+    slot :: integer(),
+    seq :: integer(),
+    err = #ccid_err{} :: #ccid_err{},
+    freq :: integer(),
+    baud :: integer()
+    }).
+
+-record(ccid_pc_to_rdr_secure, {
+    slot :: integer(),
+    seq :: integer(),
+    bwi = 0 :: integer(),
+    chain = one :: one | first | last | continue | get_next,
+    data :: binary()    % not yet decoded
     }).

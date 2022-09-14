@@ -39,10 +39,7 @@
     open/1,
     take_control/1,
     get_slot/2,
-    force_reset/1,
-    error_resp/2,
-    resp_type/1,
-    data_resp/4
+    force_reset/1
     ]).
 
 -export([
@@ -184,7 +181,8 @@ handle_call({get_slot, N}, From, S0 = #?MODULE{slots = Slots}) ->
         _ -> {reply, {error, not_found}, S0}
     end;
 
-handle_call(#urelay_reset{}, From, S0 = #?MODULE{}) ->
+handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name}) ->
+    lager:debug("[~s] reset", [Name]),
     gen_server:reply(From, #urelay_status{errno = 0}),
     S1 = S0#?MODULE{reqs = gen_statem:reqids_new(),
                     cmdlen = undefined,
@@ -196,7 +194,7 @@ handle_call(#urelay_reset{}, From, S0 = #?MODULE{}) ->
                     iwait = false},
     {noreply, S1};
 
-handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{}) ->
+handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
     #urelay_ctrl{req = Req, req_type = ReqType, length = Len, value = Val,
                  index = Index} = X,
     {Resp, S1} = case {ReqType, Req} of
@@ -331,6 +329,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{}) ->
             {ctrl_reply_data(X, <<0:16/big>>), S0};
 
         {?UT_WRITE_DEVICE, ?UR_SET_CONFIG} ->
+            lager:debug("[~s] set config ~B", [Name, Val]),
             case Val of
                 1 ->
                     {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION),
@@ -360,6 +359,8 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{}) ->
             {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
 
         _ ->
+            lager:debug("[~s] stalled due to unknown ctrl xfer: ~s", [Name,
+                ccid:pretty_print(X)]),
             {ctrl_reply(X, ?USB_ERR_STALLED), S0}
     end,
     gen_statem:reply(From, Resp),
@@ -443,7 +444,9 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIntr}, From,
     gen_statem:reply(From, Resp),
     {noreply, S1};
 
-handle_call(X = #urelay_data{}, From, S0 = #?MODULE{}) ->
+handle_call(X = #urelay_data{}, From, S0 = #?MODULE{name = Name}) ->
+    lager:debug("[~s] stalled due to unhandled xfer: ~s", [Name,
+        ccid:pretty_print(X)]),
     #urelay_data{remain = Rem} = X,
     Resp = #urelay_data_resp{blen = Rem,
                              errcode = ?USB_STALL,
@@ -478,6 +481,8 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
         {{reply, Resp}, intr, Reqs1} ->
             {noreply, S0#?MODULE{reqs = Reqs1}};
         {{reply, Resp}, Slot, Reqs1} ->
+            #?MODULE{name = Name} = S0,
+            lager:debug("[~s/~B] << ~s", [Name, Slot, ccid:pretty_print(Resp)]),
             #{Slot := {Fsm, busy}} = Slots0,
             Slots1 = Slots0#{Slot => {Fsm, idle}},
             S1 = S0#?MODULE{reqs = Reqs1, slots = Slots1},
@@ -489,63 +494,13 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
 handle_cast(_, #?MODULE{}) ->
     error(no_cast).
 
-resp_type(?CCID_PC_to_RDR_IccPowerOn)     -> ?CCID_RDR_to_PC_DataBlock;
-resp_type(?CCID_PC_to_RDR_IccPowerOff)    -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_GetSlotStatus)  -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_XfrBlock)       -> ?CCID_RDR_to_PC_DataBlock;
-resp_type(?CCID_PC_to_RDR_GetParams)      -> ?CCID_RDR_to_PC_Params;
-resp_type(?CCID_PC_to_RDR_ResetParams)    -> ?CCID_RDR_to_PC_Params;
-resp_type(?CCID_PC_to_RDR_SetParams)      -> ?CCID_RDR_to_PC_Params;
-resp_type(?CCID_PC_to_RDR_Escape)         -> ?CCID_RDR_to_PC_Escape;
-resp_type(?CCID_PC_to_RDR_IccClock)       -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_T0APDU)         -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_Secure)         -> ?CCID_RDR_to_PC_DataBlock;
-resp_type(?CCID_PC_to_RDR_Mechanical)     -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_Abort)          -> ?CCID_RDR_to_PC_SlotStatus;
-resp_type(?CCID_PC_to_RDR_SetBaudClock)   -> ?CCID_RDR_to_PC_BaudClock.
-
-error_resp(#ccid_bulk{type = ReqType, slot = Slot, seq = Seq} = Req,
-           #ccid_err{icc = IccState, cmd = CmdState, error = ErrCode} = Err) ->
-    BmIccStatus = case IccState of
-        active      -> 0;
-        inactive    -> 1;
-        not_present -> 2
-    end,
-    BmCmdStatus = case CmdState of
-        ok          -> 0;
-        failed      -> 1;
-        time_ext    -> 2
-    end,
-    Status = <<BmCmdStatus:2, 0:4, BmIccStatus:2>>,
-    #ccid_bulk{type = resp_type(ReqType), slot = Slot, seq = Seq,
-               params = <<Status/binary, ErrCode:8/signed, 0>>}.
-
-data_resp(#ccid_bulk{type = ReqType, slot = Slot, seq = Seq} = Req,
-          #ccid_err{icc = IccState, cmd = ok} = Err,
-          Params, Data) ->
-    BmIccStatus = case IccState of
-        active      -> 0;
-        inactive    -> 1;
-        not_present -> 2
-    end,
-    BmCmdStatus = 0,
-    Status = <<BmCmdStatus:2, 0:4, BmIccStatus:2>>,
-    #ccid_bulk{type = resp_type(ReqType), slot = Slot, seq = Seq,
-               params = <<Status/binary, 0, Params/binary>>,
-               data = Data}.
-
-bulk_to_bin(#ccid_bulk{type = Type, slot = Slot, seq = Seq, params = Params,
-                       data = Data}) ->
-    <<Type, (byte_size(Data)):32/little, Slot, Seq, Params/binary,
-      Data/binary>>.
-
-send_bulk_resp(B = #ccid_bulk{}, S0 = #?MODULE{rbuf = <<>>, rq = [],
-                                               epin = EpIn, rwait = Waiting}) ->
-    Bin = bulk_to_bin(B),
+send_bulk_resp(Msg, S0 = #?MODULE{rbuf = <<>>, rq = [], name = Name,
+                                  epin = EpIn, rwait = Waiting}) ->
+    Bin = ccid:encode_msg(Msg),
     S1 = if
         Waiting ->
             #?MODULE{conn_fsm = Fsm, reqs = Reqs0} = S0,
-            lager:debug("sending intr for bulk-in"),
+            lager:debug("[~s] sending intr for bulk-in", [Name]),
             Cmd = #urelay_intr{dir = ?URELAY_DIR_IN, ep = EpIn},
             Reqs1 = gen_statem:send_request(Fsm, Cmd, intr, Reqs0),
             S0#?MODULE{reqs = Reqs1};
@@ -553,40 +508,47 @@ send_bulk_resp(B = #ccid_bulk{}, S0 = #?MODULE{rbuf = <<>>, rq = [],
             S0
     end,
     S1#?MODULE{rbuf = Bin, rpos = 0, rwait = false};
-send_bulk_resp(B = #ccid_bulk{}, S0 = #?MODULE{rq = RQ0}) ->
-    Bin = bulk_to_bin(B),
+send_bulk_resp(Msg, S0 = #?MODULE{rq = RQ0}) ->
+    Bin = ccid:encode_msg(Msg),
     S0#?MODULE{rq = RQ0 ++ [Bin]}.
 
-handle_cmd(Cmd = #ccid_bulk{slot = Slot, seq = Seq},
-                                S0 = #?MODULE{slots = Slots0, reqs = Reqs0}) ->
+handle_cmd(Slot, Seq, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
+                                         name = Name}) ->
+    lager:debug("[~s/~B] >> ~s", [Name, Slot, ccid:pretty_print(Cmd)]),
     case Slots0 of
         #{Slot := {Fsm, idle}} ->
             Reqs1 = gen_statem:send_request(Fsm, Cmd, Slot, Reqs0),
             Slots1 = Slots0#{Slot => {Fsm, busy}},
             S0#?MODULE{reqs = Reqs1, slots = Slots1};
         #{Slot := {_Fsm, busy}} ->
-            Resp = error_resp(Cmd, #ccid_err{icc = active,
-                                             cmd = failed,
-                                             error = ?CCID_CMD_SLOT_BUSY}),
+            Resp = ccid:error_resp(Cmd, #ccid_err{icc = active,
+                                                  cmd = failed,
+                                                  error = ?CCID_CMD_SLOT_BUSY}),
             send_bulk_resp(Resp, S0);
         _ ->
-            Resp = error_resp(Cmd, #ccid_err{icc = not_present,
-                                             cmd = failed,
-                                             error = ?CCID_SLOT_INVALID}),
+            Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
+                                                  cmd = failed,
+                                                  error = ?CCID_SLOT_INVALID}),
             send_bulk_resp(Resp, S0)
     end.
 
-check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0}) ->
+check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
     HaveLen = iolist_size(Buf),
     if
         (HaveLen >= Len) ->
             Cmd = iolist_to_binary(lists:reverse(Buf)),
-            <<MsgType, DataLen:32/little, Slot, Seq, Params:3/binary,
-              Data:DataLen/binary>> = Cmd,
-            Bulk = #ccid_bulk{type = MsgType, slot = Slot, seq = Seq,
-                              params = Params, data = Data},
-            S1 = S0#?MODULE{cmdbuf = [], cmdlen = undefined, seq = Seq},
-            handle_cmd(Bulk, S1);
+            S1 = S0#?MODULE{cmdbuf = [], cmdlen = undefined},
+            case ccid:decode_msg(Cmd) of
+                {ok, Rec} ->
+                    Slot = element(2, Rec),
+                    Seq = element(3, Rec),
+                    S2 = S1#?MODULE{seq = Seq},
+                    handle_cmd(Slot, Seq, Rec, S2);
+                Err ->
+                    lager:debug("[~s] failed to decode ccid command ~p: ~p", [
+                        Name, Cmd, Err]),
+                    S1
+            end;
         true ->
             S0
     end.
