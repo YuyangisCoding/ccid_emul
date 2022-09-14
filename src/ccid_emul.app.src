@@ -1,0 +1,17 @@
+{application, ccid_emul,
+ [{description, "CCID emulator"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {ccid_emul_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    lager,
+    jsx
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["BSD-2-Clause"]},
+  {links, []}
+ ]}.
