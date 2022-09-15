@@ -95,6 +95,10 @@ force_reset(Pid) ->
     conn_fsm :: undefined | pid(),
     mref :: undefined | reference(),
 
+    % usb vendor/product id
+    uvid = 16#3301 :: integer(),
+    upid = 16#0010 :: integer(),
+
     % currently active config #
     actcfg = 1 :: integer(),
 
@@ -135,7 +139,8 @@ pretty_print(Rec, N) ->
 init([Name]) ->
     case ccid_fsm_db:register(Name) of
         ok ->
-            S0 = #?MODULE{name = Name},
+            <<UPid:16/little>> = crypto:strong_rand_bytes(2),
+            S0 = #?MODULE{name = Name, upid = UPid bor 16#4000},
             lager:md([{vm_name, Name}]),
             S1 = case crypto:hash(sha256, Name) of
                 <<1:1, _/bitstring>> -> S0#?MODULE{epin = 1, epout = 2};
@@ -201,12 +206,13 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
         {?UT_READ_DEVICE, ?UR_GET_DESCRIPTOR} ->
             case (Val bsr 8) of
                 ?UDESC_DEVICE ->
+                    #?MODULE{uvid = Vid, upid = Pid} = S0,
                     D0 = udescr:pack([
                         #usb_device_descr{
                             bcdUSB = {2, 0},
                             bMaxPacketSize = 8,
-                            idVendor = 16#3301,
-                            idProduct = 16#0010,
+                            idVendor = Vid,
+                            idProduct = Pid,
                             bcdDevice = 16#00,
                             iManufacturer = 1,
                             iProduct = 2,
@@ -223,14 +229,14 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                             #usb_endpoint_descr{
                                 bEndpointAddress = {in, N},
                                 bmAttributes = bulk,
-                                wMaxPacketSize = 32,
+                                wMaxPacketSize = 64,
                                 bInterval = 0
                             };
                         ({N, out}) ->
                             #usb_endpoint_descr{
                                 bEndpointAddress = {out, N},
                                 bmAttributes = bulk,
-                                wMaxPacketSize = 32,
+                                wMaxPacketSize = 64,
                                 bInterval = 0
                             };
                         ({N, int}) ->
