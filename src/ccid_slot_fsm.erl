@@ -97,6 +97,9 @@ empty(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] empty", [Name, Slot]),
     keep_state_and_data;
 
+empty({call, From}, reset, S0 = #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
 empty({call, From}, insert_card, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
     {next_state, pwr_off, S0};
@@ -167,6 +170,9 @@ pwr_off(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] powered off", [Name, Slot]),
     keep_state_and_data;
 
+pwr_off({call, From}, reset, S0 = #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
 pwr_off({call, From}, insert_card, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
     keep_state_and_data;
@@ -273,6 +279,10 @@ pwr_off({call, From}, Cmd, S0 = #?MODULE{}) ->
 pwr_on(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] powered on", [Name, Slot]),
     keep_state_and_data;
+
+pwr_on({call, From}, reset, S0 = #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    {next_state, pwr_off, S0};
 
 pwr_on({call, From}, #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
