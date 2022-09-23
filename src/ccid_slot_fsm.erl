@@ -93,6 +93,7 @@ init([Name, SlotIdx, Sup]) ->
     lager:debug("slot fsm for ~p slot ~B (~p)", [Name, SlotIdx, Sup]),
     {ok, Card} = ccid_card_fsm:open(Name, SlotIdx),
     MRef = erlang:monitor(process, Card),
+    ok = gen_statem:call(Card, reset),
     {ok, pwr_off, #?MODULE{name = Name, slotidx = SlotIdx, sup = Sup,
                            card = Card, cmref = MRef}}.
 
@@ -103,19 +104,22 @@ callback_mode() -> [state_functions, state_enter].
 
 empty(enter, _PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] empty", [Name, Slot]),
-    {keep_state, S0#?MODULE{card = undefined}};
+    {keep_state, S0};
 
 empty(info, {'DOWN', MRef, process, Card, _Why},
                                     S0 = #?MODULE{card = Card, cmref = MRef}) ->
     #?MODULE{name = Name, slotidx = SlotIdx} = S0,
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
+    ok = gen_statem:call(Card, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
-empty({call, From}, reset, #?MODULE{}) ->
+empty({call, From}, reset, #?MODULE{card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     keep_state_and_data;
-empty({call, From}, insert_card, S0 = #?MODULE{}) ->
+empty({call, From}, insert_card, S0 = #?MODULE{card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     {next_state, pwr_off, S0};
 empty({call, From}, remove_card, #?MODULE{}) ->
@@ -205,12 +209,15 @@ pwr_off(info, {'DOWN', MRef, process, Card, _Why},
     #?MODULE{name = Name, slotidx = SlotIdx} = S0,
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
+    ok = gen_statem:call(Card, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
-pwr_off({call, From}, reset, #?MODULE{}) ->
+pwr_off({call, From}, reset, #?MODULE{card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     keep_state_and_data;
-pwr_off({call, From}, insert_card, #?MODULE{}) ->
+pwr_off({call, From}, insert_card, #?MODULE{card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     keep_state_and_data;
 pwr_off({call, From}, remove_card, S0 = #?MODULE{}) ->
@@ -297,7 +304,8 @@ pwr_off({call, From}, Cmd, S0 = #?MODULE{}) ->
 wait_abort(enter, PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] awaiting abort cmd", [Name, Slot]),
     {keep_state, S0#?MODULE{abort_to = PrevState}};
-wait_abort({call, From}, reset, S0 = #?MODULE{abort_to = State}) ->
+wait_abort({call, From}, reset, S0 = #?MODULE{abort_to = State, card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     {next_state, State, S0};
 wait_abort({call, From}, X = #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq},
@@ -319,7 +327,8 @@ pwr_on(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] powered on", [Name, Slot]),
     keep_state_and_data;
 
-pwr_on({call, From}, reset, S0 = #?MODULE{}) ->
+pwr_on({call, From}, reset, S0 = #?MODULE{card = Card}) ->
+    ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     {next_state, pwr_off, S0};
 
@@ -340,6 +349,7 @@ pwr_on(info, {'DOWN', MRef, process, Card, _Why},
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
     % treat this as a card hardware error I guess?
+    ok = gen_statem:call(Card, reset),
     {next_state, pwr_off, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
