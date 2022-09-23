@@ -384,8 +384,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                         ({_OtherSlot, _Bin}) ->
                             true
                     end, RQ0),
-                    Slots1 = Slots0#{Slot => {Fsm, idle}},
-                    SS2 = SS1#?MODULE{rq = RQ1, slots = Slots1},
+                    SS2 = SS1#?MODULE{rq = RQ1},
                     {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS2};
                 _ ->
                     {ctrl_reply(X, ?USB_ERR_STALLED), S0}
@@ -556,6 +555,21 @@ send_bulk_resp(Slot, Msg, S0 = #?MODULE{rq = RQ0}) ->
     Bin = ccid:encode_msg(Msg),
     S0#?MODULE{rq = RQ0 ++ [{Slot, Bin}]}.
 
+handle_cmd(Slot, Cmd = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{slots = Slots0,
+                                                              reqs = Reqs0,
+                                                              name = Name}) ->
+    lager:debug("[~s/~B] !>>! ~s", [Name, Slot, ccid:pretty_print(Cmd)]),
+    case Slots0 of
+        #{Slot := {Fsm, _}} ->
+            Reqs1 = gen_statem:send_request(Fsm, Cmd, Slot, Reqs0),
+            Slots1 = Slots0#{Slot => {Fsm, busy}},
+            S0#?MODULE{reqs = Reqs1, slots = Slots1};
+        _ ->
+            Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
+                                                  cmd = failed,
+                                                  error = ?CCID_SLOT_INVALID}),
+            send_bulk_resp(Slot, Resp, S0)
+    end;
 handle_cmd(Slot, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
                                     name = Name}) ->
     lager:debug("[~s/~B] >> ~s", [Name, Slot, ccid:pretty_print(Cmd)]),

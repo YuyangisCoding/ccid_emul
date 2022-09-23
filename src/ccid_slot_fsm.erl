@@ -135,8 +135,7 @@ empty({call, From}, abort, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
     {next_state, wait_abort, S0};
 empty({call, From}, X = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{}) ->
-    S1 = S0#?MODULE{last_cmd = X, aborter = From},
-    {keep_state, S1};
+    {keep_state, S0#?MODULE{last_cmd = X, aborter = From}};
 
 empty({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -219,8 +218,10 @@ pwr_off({call, From}, remove_card, S0 = #?MODULE{}) ->
     {next_state, empty, S0};
 
 pwr_off({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
-                                      aborter = AbortFrom}) ->
+                                      aborter = AbortFrom,
+                                      name = Name, slotidx = Slot}) ->
     gen_statem:reply(From, ok),
+    lager:debug("[~s/~B] using stashed abort cmd", [Name, Slot]),
     #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq} = A,
     Msg = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
                                       err = #ccid_err{icc = inactive},
@@ -231,8 +232,9 @@ pwr_off({call, From}, abort, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
     {next_state, wait_abort, S0};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{}) ->
-    S1 = S0#?MODULE{last_cmd = X, aborter = From},
-    {keep_state, S1};
+    #?MODULE{name = Name, slotidx = Slot} = S0,
+    lager:debug("[~s/~B] stashing abort cmd", [Name, Slot]),
+    {keep_state, S0#?MODULE{last_cmd = X, aborter = From}};
 
 pwr_off({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -309,7 +311,7 @@ wait_abort({call, From}, X = #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq},
 wait_abort({call, From}, Cmd, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = inactive,
                                           cmd = failed,
-                                          error = ?CCID_CMD_SLOT_BUSY}),
+                                          error = ?CCID_CMD_ABORTED}),
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = Cmd}}.
 
