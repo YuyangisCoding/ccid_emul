@@ -275,7 +275,7 @@ encode_msg(#ccid_rdr_to_pc_params{slot = Slot, seq = Seq, err = Err,
         #ccid_t0_params{fidx = FIdx, didx = DIdx, convention = Conv,
                         guardtime = GuardTime, wi = WI, clockstop = Stop} ->
             ConvBit = unifbit(Conv, inverse, direct),
-            [StopLow, StopHigh] = uncollect_bits(Conv, [low, high]),
+            [StopLow, StopHigh] = uncollect_bits(Stop, [low, high]),
             PD = <<FIdx:4, DIdx:4,
                    0:6, ConvBit:1, 0:1,
                    GuardTime,
@@ -287,7 +287,7 @@ encode_msg(#ccid_rdr_to_pc_params{slot = Slot, seq = Seq, err = Err,
                         cwi = CWI, clockstop = Stop, ifsc = IFSC, nad = NAD} ->
             ConvBit = unifbit(Conv, inverse, direct),
             ChecksumBit = unifbit(Checksum, crc, lrc),
-            [StopLow, StopHigh] = uncollect_bits(Conv, [low, high]),
+            [StopLow, StopHigh] = uncollect_bits(Stop, [low, high]),
             PD = <<FIdx:4, DIdx:4,
                    0:6, ConvBit:1, ChecksumBit:1,
                    GuardTime,
@@ -321,7 +321,7 @@ encode_msg(MsgType, Slot, Seq, Params, Data) ->
 
 collect_bits([{1, Atom} | Rest]) ->
     [Atom | collect_bits(Rest)];
-collect_bits([{0, Atom} | Rest]) ->
+collect_bits([{0, _Atom} | Rest]) ->
     collect_bits(Rest);
 collect_bits([]) -> [].
 
@@ -352,13 +352,13 @@ error_resp(#ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
     #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, err = Err, data = <<>>};
 error_resp(#ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->
-    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, params = none};
+    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, err = Err, params = none};
 error_resp(#ccid_pc_to_rdr_resetparams{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->
-    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, params = none};
+    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, err = Err, params = none};
 error_resp(#ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->
-    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, params = none};
+    #ccid_rdr_to_pc_params{slot = Slot, seq = Seq, err = Err, params = none};
 error_resp(#ccid_pc_to_rdr_escape{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->
     #ccid_rdr_to_pc_escape{slot = Slot, seq = Seq, err = Err, data = <<>>};

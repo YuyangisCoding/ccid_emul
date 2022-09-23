@@ -24,11 +24,11 @@
 %% THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %%
 
--module(ccid_emul_sup).
+-module(ccid_card_sup).
 
 -behaviour(supervisor).
 
--export([start_link/0]).
+-export([start_link/0, start_child/2]).
 
 -export([init/1]).
 
@@ -36,6 +36,9 @@
 
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+start_child(Name, Idx) ->
+    supervisor:start_child(?SERVER, [Name, Idx]).
 
 %% sup_flags() = #{strategy => strategy(),         % optional
 %%                 intensity => non_neg_integer(), % optional
@@ -47,42 +50,14 @@ start_link() ->
 %%                  type => worker(),       % optional
 %%                  modules => modules()}   % optional
 init([]) ->
-    SockPath = "/var/run/ccid-emul.sock",
-    SupFlags = #{strategy => one_for_all,
-                 intensity => 5,
-                 period => 10},
-    ChildSpecs = [
-        #{
-            id      => state_mgr,
-            start   => {state_mgr, start_link, []},
-            type    => worker
-        },
-        #{
-            id      => vm_conn_sup,
-            start   => {vm_conn_sup, start_link, [SockPath]},
-            type    => supervisor
-        },
-        #{
-            id      => ccid_fsm_sup,
-            start   => {ccid_fsm_sup, start_link, []},
-            type    => supervisor
-        },
-        #{
-            id      => ccid_fsm_db,
-            start   => {ccid_fsm_db, start_link, []},
-            type    => worker
-        },
-        #{
-            id      => ccid_card_sup,
-            start   => {ccid_card_sup, start_link, []},
-            type    => supervisor
-        },
-        #{
-            id      => ccid_card_db,
-            start   => {ccid_card_db, start_link, []},
-            type    => worker
-        }
-    ],
+    SupFlags = #{strategy => simple_one_for_one,
+        intensity => 60,
+        period => 60},
+    ChildSpecs = [#{
+        id => ccid_card,
+        start => {ccid_card_fsm, start_link, []},
+        restart => transient
+    }],
     {ok, {SupFlags, ChildSpecs}}.
 
 %% internal functions

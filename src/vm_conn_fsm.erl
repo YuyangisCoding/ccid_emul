@@ -135,7 +135,7 @@ connect(info, {tcp_closed, Sock}, #?MODULE{sock = Sock}) ->
 
 connected(enter, _PrevState, #?MODULE{}) ->
     keep_state_and_data;
-connected(info, {'DOWN', MRef, process, Pid, Why},
+connected(info, {'DOWN', MRef, process, Pid, _Why},
                                     S0 = #?MODULE{fsm = Pid, mref = MRef}) ->
     {next_state, connect, S0};
 connected(info, {tcp, Sock, Data}, S0 = #?MODULE{sock = Sock, reqs = Reqs0,
