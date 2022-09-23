@@ -565,6 +565,7 @@ handle_cmd(Slot, Cmd = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{slots = Slots0,
             Slots1 = Slots0#{Slot => {Fsm, busy}},
             S0#?MODULE{reqs = Reqs1, slots = Slots1};
         _ ->
+            lager:debug("[~s/~B] dropping, invalid slot num", [Name, Slot]),
             Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                                   cmd = failed,
                                                   error = ?CCID_SLOT_INVALID}),
@@ -579,11 +580,13 @@ handle_cmd(Slot, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
             Slots1 = Slots0#{Slot => {Fsm, busy}},
             S0#?MODULE{reqs = Reqs1, slots = Slots1};
         #{Slot := {_Fsm, busy}} ->
+            lager:debug("[~s/~B] dropping, slot busy", [Name, Slot]),
             Resp = ccid:error_resp(Cmd, #ccid_err{icc = active,
                                                   cmd = failed,
                                                   error = ?CCID_CMD_SLOT_BUSY}),
             send_bulk_resp(Slot, Resp, S0);
         _ ->
+            lager:debug("[~s/~B] dropping, invalid slot num", [Name, Slot]),
             Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                                   cmd = failed,
                                                   error = ?CCID_SLOT_INVALID}),
