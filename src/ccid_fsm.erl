@@ -185,12 +185,14 @@ handle_call({get_slot, N}, _From, S0 = #?MODULE{slots = Slots}) ->
         _ -> {reply, {error, not_found}, S0}
     end;
 
-handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name, slots = Slots}) ->
+handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name, slots = Slots0}) ->
     lager:debug("[~s] reset", [Name]),
-    maps:foreach(fun (_Number, {Pid, _SlotState}) ->
-        ok = gen_statem:call(Pid, reset)
-    end, Slots),
+    Slots1 = maps:map(fun (_Number, {Pid, _SlotState}) ->
+        ok = gen_statem:call(Pid, reset),
+        {Pid, idle}
+    end, Slots0),
     S1 = S0#?MODULE{reqs = gen_statem:reqids_new(),
+                    slots = Slots1,
                     cmdlen = undefined,
                     cmdbuf = [],
                     rq = [],
