@@ -468,9 +468,20 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
     Pos1 = Pos0 + byte_size(Chunk),
     S1 = if
         (Pos1 >= byte_size(Buf)) ->
-            #?MODULE{rslot = RSlot, slots = Slots0} = S0,
+            #?MODULE{rslot = RSlot, slots = Slots0, rq = RQ} = S0,
+            % we should only ever be reading from a busy slot
             #{RSlot := {Fsm, busy}} = Slots0,
-            Slots1 = Slots0#{RSlot => {Fsm, idle}},
+            % check if there are any more responses for this slot queued up
+            % (there might be if they're SLOT_BUSY errors or abort resps)
+            MoreResps = lists:any(fun
+                ({QSlot, _}) when (QSlot == RSlot) -> true;
+                (_) -> false
+            end, RQ),
+            % if there are none, this slot is now idle
+            Slots1 = case MoreResps of
+                false -> Slots0#{RSlot => {Fsm, idle}};
+                true -> Slots0
+            end,
             S0#?MODULE{rpos = 0, rbuf = <<>>, rslot = undefined,
                        slots = Slots1};
         true ->
