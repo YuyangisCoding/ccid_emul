@@ -169,6 +169,7 @@ root_applet({call, From},
                 }
             },
             Data = iso7816:encode_ber_tlvs_map(APT, ?PIV_APT_INVTAGMAP),
+            timer:sleep(100),
             gen_statem:reply(From, #apdu_reply{data = Data}),
             {next_state, piv, S0};
         _ ->

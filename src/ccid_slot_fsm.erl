@@ -155,6 +155,7 @@ empty({call, From}, Cmd = #ccid_pc_to_rdr_xfrblock{}, S0 = #?MODULE{}) ->
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = Cmd}};
 empty({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweron{}, S0 = #?MODULE{}) ->
+    timer:sleep(1000),
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                           cmd = failed,
                                           error = ?CCID_ICC_MUTE}),
@@ -260,6 +261,7 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                     S0 = #?MODULE{card = C}) ->
     {ok, ATR} = gen_statem:call(C, get_atr),
     Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
+    timer:sleep(500),
     gen_statem:reply(From, Resp),
     {next_state, pwr_on, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
@@ -378,6 +380,7 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
 pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
                         S0 = #?MODULE{name = Name, slotidx = Slot, card = C}) ->
     #ccid_pc_to_rdr_xfrblock{data = APDUData, chain = one} = X,
+    timer:sleep(5 + byte_size(APDUData) div 2),
     APDU = iso7816:decode_apdu_cmd(APDUData),
     lager:debug("[~s/~B] APDU >> ~s", [Name, Slot, ccid:pretty_print(APDU)]),
     RAPDU = case APDU of
@@ -390,6 +393,7 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
     lager:debug("[~s/~B] APDU << ~s", [Name, Slot, ccid:pretty_print(RAPDU)]),
     RepData = iso7816:encode_apdu_reply(RAPDU),
     Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = RepData},
+    timer:sleep(5 + byte_size(RepData) div 4),
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = X}};
 
