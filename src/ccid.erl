@@ -380,4 +380,7 @@ error_resp(#ccid_pc_to_rdr_abort{slot = Slot, seq = Seq},
 error_resp(#ccid_pc_to_rdr_setbaudclock{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->
     #ccid_rdr_to_pc_baudclock{slot = Slot, seq = Seq, err = Err,
-                              freq = 0, baud = 0}.
+                              freq = 0, baud = 0};
+error_resp(#ccid_generic_msg{slot = Slot, seq = Seq},
+           #ccid_err{} = Err) ->
+    #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq, err = Err}.
