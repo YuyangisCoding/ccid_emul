@@ -173,6 +173,8 @@
 -define(CCID_PIN_CANCELLED,             -17).
 -define(CCID_CMD_SLOT_BUSY,             -32).
 -define(CCID_SLOT_INVALID,              5).
+-define(CCID_LENGTH_INVALID,            1).
+-define(CCID_PARAMS_INVALID,            7).
 -define(CCID_CMD_UNSUPPORTED,           0).
 
 -record(usb_string_descr, {

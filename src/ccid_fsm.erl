@@ -412,7 +412,7 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_OUT, ep = EpOut}, From,
     #urelay_data{remain = Rem, data = Data} = X,
     SS0 = S0#?MODULE{cmdbuf = [Data]},
     {Resp, S1} = case Data of
-        <<_MsgType, Len:32/little, _Rest/binary>> ->
+        <<_MsgType, Len:32/little, _Rest/binary>> when (Len =< 65536) ->
             SS1 = SS0#?MODULE{cmdlen = 10 + Len, cmdbuf = [Data]},
             {#urelay_data_resp{bdone = Rem}, SS1};
         _ ->

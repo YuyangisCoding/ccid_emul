@@ -251,10 +251,18 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = X}};
+pwr_off({call, From}, X = #ccid_pc_to_rdr_xfrblock{data = <<>>},
+                                S0 = #?MODULE{name = Name, slotidx = Slot}) ->
+    Resp = ccid:error_resp(X, #ccid_err{icc = active, cmd = failed,
+                                        error = ?CCID_LENGTH_INVALID}),
+    lager:debug("[~s/~B] sent zero-length xfrblock", [Name, Slot]),
+    gen_statem:reply(From, Resp),
+    {keep_state, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_xfrblock{}, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = inactive,
                                           cmd = failed,
                                           error = ?CCID_ICC_MUTE}),
+    timer:sleep(500),
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = Cmd}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
@@ -374,6 +382,14 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
     {ok, ATR} = gen_statem:call(C, get_atr),
     ok = gen_statem:call(C, reset),
     Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
+    gen_statem:reply(From, Resp),
+    {keep_state, S0#?MODULE{last_cmd = X}};
+
+pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{data = <<>>},
+                                S0 = #?MODULE{name = Name, slotidx = Slot}) ->
+    Resp = ccid:error_resp(X, #ccid_err{icc = active, cmd = failed,
+                                        error = ?CCID_LENGTH_INVALID}),
+    lager:debug("[~s/~B] sent zero-length xfrblock", [Name, Slot]),
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = X}};
 
