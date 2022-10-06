@@ -370,6 +370,7 @@ pwr_on({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
 pwr_on({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                     S0 = #?MODULE{card = C}) ->
     {ok, ATR} = gen_statem:call(C, get_atr),
+    ok = gen_statem:call(C, reset),
     Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
     gen_statem:reply(From, Resp),
     {keep_state, S0#?MODULE{last_cmd = X}};
