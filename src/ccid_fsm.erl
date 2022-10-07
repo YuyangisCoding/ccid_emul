@@ -450,6 +450,8 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_OUT, ep = EpOut}, From,
             SS1 = SS0#?MODULE{cmdlen = 10 + Len, cmdbuf = [Data]},
             {#urelay_data_resp{bdone = Rem}, SS1};
         _ ->
+            #?MODULE{name = Name} = S0,
+            lager:debug("[~s] stalled due to invalid header: ~p", [Name, Data]),
             {#urelay_data_resp{errcode = ?USB_STALL,
                                rc = ?USB_ERR_STALLED,
                                blen = Rem,
@@ -660,7 +662,8 @@ check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
                 <<>> ->
                     S0#?MODULE{cmdbuf = [], cmdlen = undefined};
                 _ ->
-                    S0#?MODULE{cmdbuf = [Rest], cmdlen = undefined}
+                    lager:debug("[~s] dropping trailing garbage: ~p", [Rest]),
+                    S0#?MODULE{cmdbuf = [], cmdlen = undefined}
             end,
             case ccid:decode_msg(Cmd) of
                 {ok, Rec} ->
