@@ -89,7 +89,7 @@ force_reset(Pid) ->
         Other -> Other
     end.
 
--type slotstate() :: idle | busy.
+-type slotstate() :: idle | busy | waiting.
 -type slot() :: integer().
 
 -record(?MODULE, {
@@ -211,7 +211,7 @@ handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name, slots = Slots0}) -
     {noreply, S1};
 
 handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
-    #urelay_ctrl{req = Req, req_type = ReqType, value = Val} = X,
+    #urelay_ctrl{req = Req, req_type = ReqType, value = Val, index = Idx} = X,
     {Resp, S1} = case {ReqType, Req} of
         {?UT_READ_DEVICE, ?UR_GET_DESCRIPTOR} ->
             case (Val bsr 8) of
@@ -344,6 +344,34 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
         {?UT_READ_ENDPOINT, ?UR_GET_STATUS} ->
             {ctrl_reply_data(X, <<0:16/big>>), S0};
 
+        {?UT_WRITE_ENDPOINT, ?UR_CLEAR_FEATURE} when (Val == ?UF_ENDPOINT_HALT) ->
+            EpAddr = case <<Idx:8>> of
+                <<0:1, 0:3, 0:4>> -> control;
+                <<0:1, 0:3, Num:4>> -> {out, Num};
+                <<1:1, 0:3, Num:4>> -> {in, Num}
+            end,
+            lager:debug("[~s] clearing stall on ~p", [Name, EpAddr]),
+            SS1 = case {EpAddr, S0} of
+                {control, _} -> S0;
+                {{out, OutEp}, #?MODULE{epout = OutEp}} ->
+                    % clearing a stall on the bulk-out
+                    % we'll drop all our command buffers
+                    S0#?MODULE{cmdlen = undefined, cmdbuf = []};
+                {{in, InEp}, #?MODULE{epin = InEp, slots = Slots0}} ->
+                    % clearing a stall on bulk-in
+                    % drop all queued messages on the floor?
+                    Slots1 = maps:map(fun
+                        (_Slot, {Fsm, busy}) -> {Fsm, busy};
+                        (_Slot, {Fsm, _}) -> {Fsm, idle}
+                    end, Slots0),
+                    S0#?MODULE{rq = [],
+                               rslot = undefined,
+                               rbuf = <<>>,
+                               rpos = 0,
+                               slots = Slots1}
+            end,
+            {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
+
         {?UT_WRITE_DEVICE, ?UR_SET_CONFIG} ->
             lager:debug("[~s] set config ~B", [Name, Val]),
             case Val of
@@ -373,7 +401,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                         [Name, Slot]),
                     ok = gen_statem:call(Fsm, abort),
                     {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
-                #{Slot := {Fsm, busy}} ->
+                #{Slot := {Fsm, _}} ->
                     lager:debug("[~s] ABORT: busy slot ~B!", [Name, Slot]),
                     ok = gen_statem:call(Fsm, abort),
                     SS1 = case S0 of
@@ -476,8 +504,8 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
         (Pos1 >= byte_size(Buf)) ->
             #?MODULE{rslot = RSlot, slots = Slots0, rq = RQ} = S0,
             case maps:get(RSlot, Slots0, none) of
-                {Fsm, busy} ->
-                    % we should only ever be reading from a busy slot
+                {Fsm, waiting} ->
+                    % we should only ever be reading from a waiting slot
                     % check if there are any more responses for this slot
                     % queued up (there might be if they're SLOT_BUSY errors or
                     % abort resps)
@@ -552,8 +580,9 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
         {{reply, Resp}, Slot, Reqs1} ->
             #?MODULE{name = Name} = S0,
             lager:debug("[~s/~B] << ~s", [Name, Slot, ccid:pretty_print(Resp)]),
-            #{Slot := {_Fsm, busy}} = Slots0,
-            S1 = S0#?MODULE{reqs = Reqs1},
+            #{Slot := {Fsm, busy}} = Slots0,
+            Slots1 = Slots0#{Slot => {Fsm, waiting}},
+            S1 = S0#?MODULE{reqs = Reqs1, slots = Slots1},
             {noreply, send_bulk_resp(Slot, Resp, S1)};
         _ ->
             {noreply, S0}
@@ -604,7 +633,7 @@ handle_cmd(Slot, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
             Reqs1 = gen_statem:send_request(Fsm, Cmd, Slot, Reqs0),
             Slots1 = Slots0#{Slot => {Fsm, busy}},
             S0#?MODULE{reqs = Reqs1, slots = Slots1};
-        #{Slot := {_Fsm, busy}} ->
+        #{Slot := {_Fsm, _}} ->
             lager:debug("[~s/~B] dropping, slot busy", [Name, Slot]),
             Resp = ccid:error_resp(Cmd, #ccid_err{icc = active,
                                                   cmd = failed,
@@ -618,12 +647,21 @@ handle_cmd(Slot, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
             send_bulk_resp(Slot, Resp, S0)
     end.
 
+check_cmd(S0 = #?MODULE{cmdlen = undefined}) -> S0;
 check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
     HaveLen = iolist_size(Buf),
     if
         (HaveLen >= Len) ->
-            Cmd = iolist_to_binary(lists:reverse(Buf)),
-            S1 = S0#?MODULE{cmdbuf = [], cmdlen = undefined},
+            <<Cmd:Len/binary, Rest/binary>> = iolist_to_binary(
+                lists:reverse(Buf)),
+            S1 = case Rest of
+                <<_MsgType, NextLen:32/little, _Rest/binary>> when (NextLen =< 65536) ->
+                    S0#?MODULE{cmdbuf = [Rest], cmdlen = 10 + NextLen};
+                <<>> ->
+                    S0#?MODULE{cmdbuf = [], cmdlen = undefined};
+                _ ->
+                    S0#?MODULE{cmdbuf = [Rest], cmdlen = undefined}
+            end,
             case ccid:decode_msg(Cmd) of
                 {ok, Rec} ->
                     Slot = element(2, Rec),
@@ -634,11 +672,11 @@ check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
                         true -> ok
                     end,
                     S2 = S1#?MODULE{seq = Seq},
-                    handle_cmd(Slot, Rec, S2);
+                    check_cmd(handle_cmd(Slot, Rec, S2));
                 Err ->
                     lager:debug("[~s] failed to decode ccid command ~p: ~p", [
                         Name, Cmd, Err]),
-                    S1
+                    check_cmd(S1)
             end;
         true ->
             S0

@@ -60,6 +60,10 @@
 -define(UR_SET_SEL,                             16#30).
 -define(UR_ISOCH_DELAY,                         16#31).
 
+-define(UF_ENDPOINT_HALT,                       16#00).
+-define(UF_DEVICE_REMOTE_WAKEUP,                16#01).
+-define(UF_TEST_MODE,                           16#02).
+
 -define(UDESC_CCID,                             16#21).
 
 -define(UT_WRITE,                               16#00).
