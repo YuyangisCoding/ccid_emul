@@ -31,6 +31,8 @@
 
 -compile([{parse_transform, lager_transform}]).
 
+-vsn({1,0}).
+
 -export([pretty_print/1]).
 
 -export([
@@ -42,6 +44,7 @@
     init/1,
     callback_mode/0,
     terminate/3,
+    code_change/4,
     root_applet/3,
     piv/3
     ]).
@@ -137,6 +140,9 @@ init([Name, SlotIdx, Sup]) ->
 
 terminate(_Why, _State, #?MODULE{}) ->
     ok.
+
+code_change(_OldVsn, OldState, S0, _Extra) ->
+    {ok, OldState, S0}.
 
 callback_mode() -> [state_functions, state_enter].
 

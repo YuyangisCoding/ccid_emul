@@ -30,6 +30,8 @@
 -include("include/records.hrl").
 -include("include/usb.hrl").
 
+-vsn({1,0}).
+
 -compile([{parse_transform, lager_transform}]).
 
 -export([pretty_print/1]).
@@ -45,6 +47,7 @@
 -export([
     init/1,
     terminate/2,
+    code_change/3,
     handle_call/3,
     handle_info/2,
     handle_cast/2
@@ -161,6 +164,9 @@ start_slots(S0 = #?MODULE{name = Name}) ->
 
 terminate(_Why, #?MODULE{}) ->
     ok.
+
+code_change(_OldVsn, S0, _Extra) ->
+    {ok, S0}.
 
 ctrl_reply(#urelay_ctrl{length = Len}, RC) ->
     #urelay_ctrl_resp{rc = RC, blen = Len, bdone = 0}.

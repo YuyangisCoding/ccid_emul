@@ -33,24 +33,36 @@
 
 -compile([{parse_transform, lager_transform}]).
 
+-vsn({2, 0}).
+
 -export([pretty_print/1]).
 
 -export([
     start_link/3,
     remove_card/1,
-    insert_card/1
+    insert_card/1,
+    config_err/4
     ]).
 
 -export([
     init/1,
     callback_mode/0,
     terminate/3,
+    code_change/4,
     empty/3,
     pwr_off/3,
     pwr_on/3,
     wait_abort/3
     %mute/3
     ]).
+
+-type err_scenario() :: power_on | apdu.
+%% Scenario for error injection.
+-type err_type() :: long_sleep | hw_error | parity | ripped.
+%% Types of error which are allowed to be injected at random.
+-type p_err() :: integer().
+%% 0-100, percent probability of an error
+-type err_config() :: #{err_scenario() => {p_err(), [err_type()]}}.
 
 -spec start_link(string(), integer(), pid()) -> {ok, pid()} | {error, term()}.
 start_link(Name, SlotIdx, Sup) ->
@@ -64,6 +76,10 @@ remove_card(Pid) ->
 insert_card(Pid) ->
     gen_statem:call(Pid, insert_card).
 
+-spec config_err(pid(), err_scenario(), p_err(), [err_type()]) -> ok | {error, term()}.
+config_err(Pid, Scenario, PErr, Types) ->
+    gen_statem:call(Pid, {config_err, Scenario, {PErr, Types}}).
+
 -record(?MODULE, {
     sup :: pid(),
     name :: string(),
@@ -72,7 +88,8 @@ insert_card(Pid) ->
     aborter :: undefined | gen_statem:from(),
     abort_to :: undefined | atom(),
     card :: pid(),
-    cmref :: reference()
+    cmref :: reference(),
+    err = #{} :: err_config()
     }).
 
 -define(pp(Rec),
@@ -100,7 +117,32 @@ init([Name, SlotIdx, Sup]) ->
 terminate(_Why, _State, #?MODULE{}) ->
     ok.
 
+code_change(_OldVsn, OldState, S0, _Extra) when (element(1, S0) =:= ?MODULE) and
+                                                (tuple_size(S0) == 9) ->
+    L0 = tuple_to_list(S0),
+    S1 = list_to_tuple(L0 ++ [#{}]),
+    #?MODULE{} = S1,
+    {ok, OldState, S1}.
+
 callback_mode() -> [state_functions, state_enter].
+
+-spec inject_err(err_scenario(), [err_type()], #?MODULE{}) -> {error, err_type()} | ok.
+inject_err(Scenario, AllowTypes, #?MODULE{err = E, name = Name, slotidx = Slot}) ->
+    {PErr, Types} = maps:get(Scenario, E, {0, []}),
+    R = rand:uniform(100),
+    if
+        (R =< PErr) ->
+            PickTypes = list_to_tuple(sets:to_list(sets:intersection(
+                sets:from_list(AllowTypes),
+                sets:from_list(Types)))),
+            Idx = rand:uniform(tuple_size(PickTypes)),
+            Type = element(Idx, PickTypes),
+            lager:debug("[~s/~B] !! injecting error: ~p => ~p", [Name, Slot,
+                Scenario, Type]),
+            {error, Type};
+        true ->
+            ok
+    end.
 
 empty(enter, _PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] empty", [Name, Slot]),
@@ -125,6 +167,10 @@ empty({call, From}, insert_card, S0 = #?MODULE{card = Card}) ->
 empty({call, From}, remove_card, #?MODULE{}) ->
     gen_statem:reply(From, ok),
     keep_state_and_data;
+empty({call, From}, {config_err, Scenario, Config}, S0 = #?MODULE{err = E0}) ->
+    E1 = E0#{Scenario => Config},
+    gen_statem:reply(From, ok),
+    {keep_state, S0#?MODULE{err = E1}};
 
 empty({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
                                     aborter = AbortFrom}) ->
@@ -224,6 +270,10 @@ pwr_off({call, From}, insert_card, #?MODULE{card = Card}) ->
 pwr_off({call, From}, remove_card, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
     {next_state, empty, S0};
+pwr_off({call, From}, {config_err, Scenario, Config}, S0 = #?MODULE{err = E0}) ->
+    E1 = E0#{Scenario => Config},
+    gen_statem:reply(From, ok),
+    {keep_state, S0#?MODULE{err = E1}};
 
 pwr_off({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
                                       aborter = AbortFrom,
@@ -267,11 +317,35 @@ pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_xfrblock{}, S0 = #?MODULE{}) ->
     {keep_state, S0#?MODULE{last_cmd = Cmd}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                     S0 = #?MODULE{card = C}) ->
-    {ok, ATR} = gen_statem:call(C, get_atr),
-    Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
-    timer:sleep(500),
-    gen_statem:reply(From, Resp),
-    {next_state, pwr_on, S0#?MODULE{last_cmd = X}};
+    case inject_err(power_on, [long_sleep, hw_error, parity], S0) of
+        {error, long_sleep} ->
+            timer:sleep(30000),
+            Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
+                                                  cmd = failed,
+                                                  error = ?CCID_ICC_MUTE}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        {error, hw_error} ->
+            timer:sleep(100),
+            Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
+                                                  cmd = failed,
+                                                  error = ?CCID_HW_ERROR}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        {error, parity} ->
+            timer:sleep(500),
+            Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
+                                                  cmd = failed,
+                                                  error = ?CCID_XFR_PARITY_ERR}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        ok ->
+            {ok, ATR} = gen_statem:call(C, get_atr),
+            Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
+            timer:sleep(500),
+            gen_statem:reply(From, Resp),
+            {next_state, pwr_on, S0#?MODULE{last_cmd = X}}
+    end;
 pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
@@ -318,6 +392,8 @@ wait_abort({call, From}, reset, S0 = #?MODULE{abort_to = State, card = Card}) ->
     ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
     {next_state, State, S0};
+wait_abort({call, _From}, _Other, #?MODULE{}) ->
+    {keep_state_and_data, [postpone]};
 wait_abort({call, From}, X = #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq},
                                             S0 = #?MODULE{abort_to = State}) ->
     % XXX: the state should decide what err and clock we put here?
@@ -397,21 +473,56 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
                         S0 = #?MODULE{name = Name, slotidx = Slot, card = C}) ->
     #ccid_pc_to_rdr_xfrblock{data = APDUData, chain = one} = X,
     timer:sleep(5 + byte_size(APDUData) div 2),
-    APDU = iso7816:decode_apdu_cmd(APDUData),
-    lager:debug("[~s/~B] APDU >> ~s", [Name, Slot, ccid:pretty_print(APDU)]),
-    RAPDU = case APDU of
-        #apdu_cmd{} ->
-            gen_statem:call(C, APDU);
-        {error, Why} ->
-            lager:debug("apdu decode failed: ~p", [Why]),
-            #apdu_reply{sw = {error, general_failure}}
-    end,
-    lager:debug("[~s/~B] APDU << ~s", [Name, Slot, ccid:pretty_print(RAPDU)]),
-    RepData = iso7816:encode_apdu_reply(RAPDU),
-    Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = RepData},
-    timer:sleep(5 + byte_size(RepData) div 4),
-    gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    case inject_err(apdu, [long_sleep, hw_error, parity, ripped], S0) of
+        {error, long_sleep} ->
+            timer:sleep(30000),
+            Resp = ccid:error_resp(X, #ccid_err{icc = active,
+                                                cmd = failed,
+                                                error = ?CCID_ICC_MUTE}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        {error, hw_error} ->
+            timer:sleep(100),
+            Resp = ccid:error_resp(X, #ccid_err{icc = active,
+                                                cmd = failed,
+                                                error = ?CCID_HW_ERROR}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        {error, parity} ->
+            timer:sleep(100),
+            Resp = ccid:error_resp(X, #ccid_err{icc = active,
+                                                cmd = failed,
+                                                error = ?CCID_XFR_PARITY_ERR}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}};
+        {error, ripped} ->
+            timer:sleep(500),
+            Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
+                                                cmd = failed,
+                                                error = ?CCID_ICC_MUTE}),
+            gen_statem:reply(From, Resp),
+            {next_state, empty, S0#?MODULE{last_cmd = X}};
+        ok ->
+            APDU = iso7816:decode_apdu_cmd(APDUData),
+            lager:debug("[~s/~B] APDU >> ~s", [Name, Slot,
+                ccid:pretty_print(APDU)]),
+            RAPDU = case APDU of
+                #apdu_cmd{} ->
+                    gen_statem:call(C, APDU);
+                {error, Why} ->
+                    lager:debug("apdu decode failed: ~p", [Why]),
+                    #apdu_reply{sw = {error, general_failure}}
+            end,
+            lager:debug("[~s/~B] APDU << ~s", [Name, Slot,
+                ccid:pretty_print(RAPDU)]),
+            RepData = iso7816:encode_apdu_reply(RAPDU),
+            Resp = #ccid_rdr_to_pc_datablock{slot = Slot,
+                                             seq = Seq,
+                                             data = RepData},
+            timer:sleep(5 + byte_size(RepData) div 4),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{last_cmd = X}}
+    end;
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->

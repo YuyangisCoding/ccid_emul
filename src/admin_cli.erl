@@ -32,7 +32,8 @@
     list/1,
     reset/1,
     eject/1,
-    insert/1
+    insert/1,
+    inject_err/1
     ]).
 
 help(_) ->
@@ -43,7 +44,12 @@ help(_) ->
               "                dump <name> [slot]\n"
               "                reset <name>\n"
               "                eject <name> <slot>\n"
-              "                insert <name> <slot>\n").
+              "                insert <name> <slot>\n"
+              "                inject_err <name> <slot> <scenario> <percent> [type0] [type1]...\n"
+              "\n"
+              "ERROR INJECTION\n"
+              "    scenarios:    power_on, apdu\n"
+              "    error types:  long_sleep, hw_error, parity, ripped\n").
 
 list([Prefix]) ->
     {ok, Results} = ccid_fsm_db:lookup_prefix(Prefix),
@@ -80,3 +86,13 @@ dump([Name, SlotIdxStr]) ->
     {ok, SlotPid} = ccid_fsm:get_slot(Pid, SlotIdx),
     io:format("~s\n", [ccid_slot_fsm:pretty_print(sys:get_state(SlotPid))]);
 dump(_) -> help([]).
+
+inject_err([Name, SlotIdxStr, ScenarioStr, PercentStr | TypeStrs]) ->
+    SlotIdx = list_to_integer(SlotIdxStr),
+    Scenario = list_to_existing_atom(ScenarioStr),
+    Percent = list_to_integer(PercentStr),
+    Types = [list_to_existing_atom(X) || X <- TypeStrs],
+    {ok, Pid} = ccid_fsm_db:lookup(list_to_binary(Name)),
+    {ok, SlotPid} = ccid_fsm:get_slot(Pid, SlotIdx),
+    ccid_slot_fsm:config_err(SlotPid, Scenario, Percent, Types);
+inject_err(_) -> help([]).
