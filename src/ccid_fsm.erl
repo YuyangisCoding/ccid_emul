@@ -662,7 +662,8 @@ check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
                 <<>> ->
                     S0#?MODULE{cmdbuf = [], cmdlen = undefined};
                 _ ->
-                    lager:debug("[~s] dropping trailing garbage: ~p", [Rest]),
+                    lager:debug("[~s] dropping trailing garbage: ~p",
+                        [Name, Rest]),
                     S0#?MODULE{cmdbuf = [], cmdlen = undefined}
             end,
             case ccid:decode_msg(Cmd) of
