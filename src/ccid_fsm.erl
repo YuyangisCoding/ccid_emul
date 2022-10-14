@@ -491,13 +491,16 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
                         S0 = #?MODULE{rbuf = Buf, rpos = Pos0, epin = EpIn}) ->
     #urelay_data{remain = Rem} = X,
     ActualRem = byte_size(Buf) - Pos0,
-    {RC, Chunk} = if
+    {RC, EC, Chunk} = if
         (Rem > ActualRem) ->
-            {?USB_ERR_SHORT_XFER, binary:part(Buf, {Pos0, ActualRem})};
+            {?USB_ERR_SHORT_XFER, ?USB_SHORT,
+             binary:part(Buf, {Pos0, ActualRem})};
         (ActualRem >= Rem) ->
-            {?USB_ERR_NORMAL_COMPLETION, binary:part(Buf, {Pos0, Rem})}
+            {?USB_ERR_NORMAL_COMPLETION, ?USB_ACK,
+             binary:part(Buf, {Pos0, Rem})}
     end,
     Resp = #urelay_data_resp{rc = RC,
+                             errcode = EC,
                              bdone = byte_size(Chunk),
                              blen = Rem - byte_size(Chunk),
                              data = Chunk},
