@@ -164,9 +164,19 @@ cancel_waiter(S0 = #?MODULE{idle_to = PrevState, last_cmd = X, waiter = From}) -
     S0#?MODULE{card_req = undefined, waiter = undefined}.
 
 busy(enter, PrevState, S0 = #?MODULE{idle_to = undefined}) ->
-    {keep_state, S0#?MODULE{idle_to = PrevState}};
+    {keep_state, S0#?MODULE{idle_to = PrevState},
+     [{state_timeout, 4000, time_ext}]};
 busy(enter, _PrevState, #?MODULE{}) ->
+    {keep_state_and_data, [{state_timeout, 4000, time_ext}]};
+
+busy(state_timeout, time_ext, #?MODULE{card_req = undefined}) ->
     keep_state_and_data;
+busy(state_timeout, time_ext, #?MODULE{sup = Sup, last_cmd = X,
+                                       slotidx = Slot}) ->
+    Reply = ccid:error_resp(X, #ccid_err{icc = active, cmd = time_ext,
+                                         error = 1}),
+    gen_server:cast(Sup, {interim_reply, self(), Slot, Reply}),
+    {keep_state_and_data, [{state_timeout, 4000, time_ext}]};
 
 busy(info, {'DOWN', MRef, process, Card, _Why},
                                     S0 = #?MODULE{card = Card, cmref = MRef}) ->
@@ -194,20 +204,21 @@ busy(info, Msg, S0 = #?MODULE{card_req = ReqId, waiter = From}) ->
             keep_state_and_data
     end;
 
-busy({call, From}, {finish_read, Seq}, S0 = #?MODULE{last_cmd = Cmd,
-                                                     name = Name,
+busy({call, From}, {finish_read, Seq}, S0 = #?MODULE{card_req = undefined,
+                                                     last_cmd = Cmd,
                                                      slotidx = Slot}) ->
     case ccid:slot_seq(Cmd) of
         {Slot, Seq} ->
             #?MODULE{idle_to = PrevState} = S0,
             gen_statem:reply(From, ok),
             {next_state, PrevState, S0#?MODULE{idle_to = undefined}};
-        {Slot, OtherSeq} ->
-            lager:debug("[~s/~B] finish read on other seq: ~B (expected ~B)",
-                [Name, Slot, Seq, OtherSeq]),
+        {Slot, _OtherSeq} ->
             gen_statem:reply(From, ok),
             keep_state_and_data
     end;
+busy({call, From}, {finish_read, _}, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
 
 busy({call, From}, stall_clear, S0 = #?MODULE{idle_to = PrevState}) ->
     gen_statem:reply(From, ok),

@@ -613,6 +613,15 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
             {noreply, S0}
     end.
 
+handle_cast({interim_reply, Fsm, Slot, Resp}, S0 = #?MODULE{}) ->
+    #?MODULE{name = Name, slots = Slots0} = S0,
+    #{Slot := Fsm} = Slots0,
+    {Slot, _Seq} = ccid:slot_seq(Resp),
+    lager:debug("[~s/~B] <..< ~s", [Name, Slot, ccid:pretty_print(Resp)]),
+    #{Slot := Fsm} = Slots0,
+    true = is_pid(Fsm),
+    {noreply, send_bulk_resp(Resp, S0)};
+
 handle_cast({slot_presence, Fsm, Slot, Pres},
                             S0 = #?MODULE{slots = Slots0, slast = Last0}) ->
     #?MODULE{name = Name} = S0,
