@@ -161,7 +161,8 @@ init([Name]) ->
 
 start_slots(S0 = #?MODULE{name = Name}) ->
     {ok, Slot0} = ccid_slot_fsm:start_link(Name, 0, self()),
-    S0#?MODULE{slots = #{0 => Slot0}}.
+    {ok, Slot1} = ccid_slot_fsm:start_link(Name, 1, self()),
+    S0#?MODULE{slots = #{0 => Slot0, 1 => Slot1}}.
 
 terminate(_Why, #?MODULE{}) ->
     ok.
@@ -277,7 +278,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                         },
                         #usb_ccid_descr{
                             bcdCCID = {1, 10},
-                            bMaxSlotIndex = 0,
+                            bMaxSlotIndex = 1,
                             bVoltageSupport = ['5v', '3v', '1.8v'],
                             dwProtocols = [t1, t0],
                             dwDefaultClock = 3580,
@@ -296,7 +297,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                             bClassEnvelope = 16#FF,
                             wLcdLayout = none,
                             bPINSupport = [],
-                            bMaxCCIDBusySlots = 1
+                            bMaxCCIDBusySlots = 2
                         }
                     ] ++ EpDescrs),
                     {ctrl_reply_data(X, D0), S0};
@@ -409,9 +410,11 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                     {ctrl_reply(X, ?USB_ERR_STALLED), S0}
             end;
         {?UT_READ_CLASS_INTERFACE, ?CCID_CTRL_GET_CLOCK} ->
-            {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
+            Data = <<3580:32/little>>,
+            {ctrl_reply_data(X, Data), S0};
         {?UT_READ_CLASS_INTERFACE, ?CCID_CTRL_GET_BAUD} ->
-            {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
+            Data = <<9600:32/little, 115200:32/little>>,
+            {ctrl_reply_data(X, Data), S0};
 
         {0, ?UR_SET_SEL} ->
             {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
