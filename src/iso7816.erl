@@ -325,6 +325,24 @@ decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, Le>>) ->
         p2 = P2,
         le = Le
     };
+decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, 0, Lc:16/big, Data:Lc/binary>>) ->
+    Cla = decode_cla(ClaBin),
+    #apdu_cmd{
+        cla = Cla,
+        ins = decode_ins(Cla, Ins),
+        p1 = P1,
+        p2 = P2,
+        data = Data
+    };
+decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, 0, Le:16/big>>) ->
+    Cla = decode_cla(ClaBin),
+    #apdu_cmd{
+        cla = Cla,
+        ins = decode_ins(Cla, Ins),
+        p1 = P1,
+        p2 = P2,
+        le = Le
+    };
 decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, Lc, Data:Lc/binary>>) ->
     Cla = decode_cla(ClaBin),
     #apdu_cmd{
@@ -333,6 +351,16 @@ decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, Lc, Data:Lc/binary>>) ->
         p1 = P1,
         p2 = P2,
         data = Data
+    };
+decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, 0, Lc:16/big, Data:Lc/binary, 0, Le:16/big>>) ->
+    Cla = decode_cla(ClaBin),
+    #apdu_cmd{
+        cla = Cla,
+        ins = decode_ins(Cla, Ins),
+        p1 = P1,
+        p2 = P2,
+        data = Data,
+        le = Le
     };
 decode_apdu_cmd(<<ClaBin:1/binary, Ins, P1, P2, Lc, Data:Lc/binary, Le>>) ->
     Cla = decode_cla(ClaBin),
@@ -353,6 +381,11 @@ encode_apdu_cmd(#apdu_cmd{cla = Cla, ins = Ins, p1 = P1, p2 = P2,
     InsInt = encode_ins(Ins),
     <<ClaBin/binary, InsInt, P1, P2>>;
 encode_apdu_cmd(#apdu_cmd{cla = Cla, ins = Ins, p1 = P1, p2 = P2,
+                          data = none, le = Le}) when (Le > 255) ->
+    ClaBin = encode_cla(Cla),
+    InsInt = encode_ins(Ins),
+    <<ClaBin/binary, InsInt, P1, P2, 0, Le:16/big>>;
+encode_apdu_cmd(#apdu_cmd{cla = Cla, ins = Ins, p1 = P1, p2 = P2,
                           data = none, le = Le}) ->
     ClaBin = encode_cla(Cla),
     InsInt = encode_ins(Ins),
@@ -361,12 +394,25 @@ encode_apdu_cmd(#apdu_cmd{cla = Cla, ins = Ins, p1 = P1, p2 = P2,
                           data = Data, le = none}) ->
     ClaBin = encode_cla(Cla),
     InsInt = encode_ins(Ins),
-    <<ClaBin/binary, InsInt, P1, P2, (byte_size(Data)):8, Data/binary>>;
+    if
+        (byte_size(Data) > 255) ->
+            <<ClaBin/binary, InsInt, P1, P2, 0, (byte_size(Data)):16/big,
+              Data/binary>>;
+        true ->
+            <<ClaBin/binary, InsInt, P1, P2, (byte_size(Data)):8, Data/binary>>
+    end;
 encode_apdu_cmd(#apdu_cmd{cla = Cla, ins = Ins, p1 = P1, p2 = P2,
                           data = Data, le = Le}) ->
     ClaBin = encode_cla(Cla),
     InsInt = encode_ins(Ins),
-    <<ClaBin/binary, InsInt, P1, P2, (byte_size(Data)):8, Data/binary, Le>>;
+    if
+        (byte_size(Data) > 255) or (Le > 255) ->
+            <<ClaBin/binary, InsInt, P1, P2, 0, (byte_size(Data)):16/big,
+              Data/binary, 0, Le:16/big>>;
+        true ->
+            <<ClaBin/binary, InsInt, P1, P2, (byte_size(Data)):8,
+              Data/binary, Le>>
+    end;
 encode_apdu_cmd(_) -> error(bad_format).
 
 decode_sw(<<16#90, _>>) -> ok;

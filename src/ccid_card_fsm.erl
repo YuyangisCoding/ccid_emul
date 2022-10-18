@@ -54,8 +54,14 @@
 -define(PIV_AID, ?NIST_RID, ?PIV_PIX).
 
 -define(PIV_GETDATA_TAGMAP, #{
-    16#5C => tag
+    16#5C => tag,
+    16#53 => data
 }).
+
+-define(PIV_GETDATA_INVTAGMAP, #{
+    tag => 16#5C,
+    data => 16#53
+    }).
 
 -define(PIV_APT_INVTAGMAP, #{
     apt => {16#61, [
@@ -110,7 +116,8 @@ open(Name, SlotIdx) ->
 -record(?MODULE, {
     sup :: pid(),
     name :: string(),
-    slotidx :: integer()
+    slotidx :: integer(),
+    files :: #{binary() => binary()}
     }).
 
 -define(pp(Rec),
@@ -178,6 +185,12 @@ root_applet({call, From},
             timer:sleep(100),
             gen_statem:reply(From, #apdu_reply{data = Data}),
             {next_state, piv, S0};
+        <<16#33, 16#01, MSec:16/big>> ->
+            #?MODULE{slotidx = SlotIdx} = S0,
+            timer:sleep(MSec),
+            Data = <<SlotIdx, MSec:16/big>>,
+            gen_statem:reply(From, #apdu_reply{data = Data}),
+            keep_state_and_data;
         _ ->
             Reply = #apdu_reply{sw = {error, {file, not_found}}},
             gen_statem:reply(From, Reply),
@@ -212,11 +225,37 @@ piv({call, From},
             },
             OutData = iso7816:encode_ber_tlvs_map(Chuid, ?PIV_CHUID_INVTAGMAP),
             #apdu_reply{data = OutData};
+        #{tag := File} ->
+            #?MODULE{files = F0} = S0,
+            case F0 of
+                #{File := Data} ->
+                    OutTags = #{data => Data},
+                    OutData = iso7816:encode_ber_tlvs_map(OutTags,
+                        ?PIV_GETDATA_INVTAGMAP),
+                    #apdu_reply{data = OutData};
+                _ ->
+                    #apdu_reply{sw = {error, {file, not_found}}}
+            end;
         _ ->
             #apdu_reply{sw = {error, {file, not_found}}}
     end,
     gen_statem:reply(From, Reply),
     keep_state_and_data;
+piv({call, From},
+        #apdu_cmd{cla = iso, ins = put_data, p1 = 16#3F, p2 = 16#FF,
+                  data = Data},
+        S0 = #?MODULE{}) ->
+    {ok, Tags} = iso7816:decode_ber_tlvs_map(Data, ?PIV_GETDATA_TAGMAP),
+    {Reply, S1} = case Tags of
+        #{tag := <<16#5F, 16#C1, 16#02>>} ->
+            {#apdu_reply{sw = {error, {denied, incompat_file}}}, S0};
+        #{tag := File, data := Data} ->
+            #?MODULE{files = F0} = S0,
+            F1 = F0#{File => Data},
+            {#apdu_reply{sw = ok}, S0#?MODULE{files = F1}}
+    end,
+    gen_statem:reply(From, Reply),
+    {keep_state, S1};
 piv({call, From}, #apdu_cmd{cla = iso, ins = 16#FD, p1 = 0, p2 = 0},
                                                             #?MODULE{}) ->
     gen_statem:reply(From, #apdu_reply{data = <<33, 0, 1>>}),
