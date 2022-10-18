@@ -32,12 +32,14 @@
 
 -export([pretty_print/1, pretty_print/2]).
 
--export([decode_msg/1, encode_msg/1, error_resp/2, slot_seq/1]).
+-export([decode_msg/1, encode_msg/1, error_resp/2, slot_seq/1, encode_intr/1]).
 
 -export_type([
-    msg/0, host_msg/0, device_msg/0
+    msg/0, host_msg/0, device_msg/0, intr/0
     ]).
 
+-type intr() :: #ccid_rdr_to_pc_notifyslotchange{} |
+    #ccid_rdr_to_pc_hardwareerror{}.
 -type msg() :: host_msg() | device_msg().
 -type host_msg() :: #ccid_generic_msg{} | #ccid_pc_to_rdr_iccpoweron{}.
 -type device_msg() :: #ccid_generic_msg{} | #ccid_rdr_to_pc_datablock{} |
@@ -84,6 +86,8 @@ pretty_print(Record) ->
 ?pp(ccid_rdr_to_pc_escape);
 ?pp(ccid_rdr_to_pc_baudclock);
 ?pp(ccid_pc_to_rdr_secure);
+?pp(ccid_rdr_to_pc_notifyslotchange);
+?pp(ccid_rdr_to_pc_hardwareerror);
 ?pp(ccid_generic_msg);
 ?pp(usb_ccid_descr);
 ?pp(usb_endpoint_descr);
@@ -319,6 +323,28 @@ encode_msg(MsgType, Slot, Seq, Params, Data) ->
     <<MsgType, (byte_size(Data)):32/little, Slot, Seq, Params/binary,
       Data/binary>>.
 
+-spec encode_intr(intr()) -> binary().
+encode_intr(#ccid_rdr_to_pc_notifyslotchange{slots = Map}) ->
+    NSlots = lists:max(maps:keys(Map)) + 1,
+    BitSize = (((NSlots * 2) div 8) + 1) * 8,
+    N = maps:fold(fun (Slot, {Pres, Ch}, Acc0) ->
+        Offset = Slot * 2,
+        Acc1 = case Pres of
+            present -> Acc0 bor (1 bsl Offset);
+            not_present -> Acc0
+        end,
+        case Ch of
+            change -> Acc1 bor (1 bsl (Offset + 1));
+            no_change -> Acc1
+        end
+    end, 0, Map),
+    <<?CCID_RDR_to_PC_NotifySlotChange, N:BitSize/little>>;
+encode_intr(#ccid_rdr_to_pc_hardwareerror{slot = Slot, seq = Seq,
+                                          error = Errs}) ->
+    [Overcurrent] = uncollect_bits(Errs, [overcurrent]),
+    ErrMask = <<0:7, Overcurrent:1>>,
+    <<?CCID_RDR_to_PC_HardwareError, Slot, Seq, ErrMask/binary>>.
+
 collect_bits([{1, Atom} | Rest]) ->
     [Atom | collect_bits(Rest)];
 collect_bits([{0, _Atom} | Rest]) ->
@@ -357,8 +383,7 @@ slot_seq(#ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq}) -> {Slot, Seq};
 slot_seq(#ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq}) -> {Slot, Seq};
 slot_seq(#ccid_rdr_to_pc_params{slot = Slot, seq = Seq}) -> {Slot, Seq};
 slot_seq(#ccid_rdr_to_pc_escape{slot = Slot, seq = Seq}) -> {Slot, Seq};
-slot_seq(#ccid_rdr_to_pc_baudclock{slot = Slot, seq = Seq}) -> {Slot, Seq};
-slot_seq(#ccid_pc_to_rdr_secure{slot = Slot, seq = Seq}) -> {Slot, Seq}.
+slot_seq(#ccid_rdr_to_pc_baudclock{slot = Slot, seq = Seq}) -> {Slot, Seq}.
 
 error_resp(#ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->

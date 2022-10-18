@@ -243,7 +243,8 @@ busy({call, From}, Cmd, S0 = #?MODULE{idle_to = RetState}) ->
     % don't update last_cmd, we use that!
     {keep_state, S0}.
 
-empty(enter, _PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
+empty(enter, _PrevState, S0 = #?MODULE{sup = Sup, name = Name, slotidx = Slot}) ->
+    gen_server:cast(Sup, {slot_presence, self(), Slot, not_present}),
     lager:debug("[~s/~B] empty", [Name, Slot]),
     {keep_state, S0};
 
@@ -354,7 +355,8 @@ empty({call, From}, Cmd, S0 = #?MODULE{}) ->
     {next_state, busy, S0#?MODULE{last_cmd = Cmd}}.
 
 
-pwr_off(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
+pwr_off(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot, sup = Sup}) ->
+    gen_server:cast(Sup, {slot_presence, self(), Slot, present}),
     lager:debug("[~s/~B] powered off", [Name, Slot]),
     keep_state_and_data;
 

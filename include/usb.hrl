@@ -161,6 +161,9 @@
 -define(CCID_RDR_to_PC_Escape,          16#83).
 -define(CCID_RDR_to_PC_BaudClock,       16#84).
 
+-define(CCID_RDR_to_PC_NotifySlotChange,    16#50).
+-define(CCID_RDR_to_PC_HardwareError,       16#51).
+
 -define(CCID_CMD_ABORTED,               -1).
 -define(CCID_ICC_MUTE,                  -2).
 -define(CCID_XFR_PARITY_ERR,            -3).
@@ -420,4 +423,14 @@
     bwi = 0 :: integer(),
     chain = one :: one | first | last | continue | get_next,
     data :: binary()    % not yet decoded
+    }).
+
+-record(ccid_rdr_to_pc_notifyslotchange, {
+    slots :: #{integer() => {present | not_present, change | no_change}}
+    }).
+
+-record(ccid_rdr_to_pc_hardwareerror, {
+    slot :: integer(),
+    seq :: integer(),
+    error :: [overcurrent]
     }).

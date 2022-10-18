@@ -94,7 +94,9 @@ force_reset(Pid) ->
 
 -record(?MODULE, {
     name :: string(),
-    slots :: #{slot() => pid()},
+    slots = #{} :: #{slot() => pid()},
+    slast = #{} :: #{slot() => present | not_present},
+    nslots = 0 :: integer(),
     reqs = gen_statem:reqids_new() :: gen_statem:request_id_collection(),
     conn_fsm :: undefined | pid(),
     mref :: undefined | reference(),
@@ -121,6 +123,9 @@ force_reset(Pid) ->
     rseq = undefined :: undefined | seq(),
     rbuf = <<>> :: binary(),
     rpos = 0 :: integer(),
+
+    % interrupts
+    iq = [] :: [binary()],
 
     rwait = false :: boolean(),     % bulk-in transfer waiting
     iwait = false :: boolean(),     % interrupt transfer waiting
@@ -149,20 +154,29 @@ init([Name]) ->
             S0 = #?MODULE{name = Name, upid = UPid bor 16#4000},
             lager:md([{vm_name, Name}]),
             S1 = case crypto:hash(sha256, Name) of
-                <<1:1, _/bitstring>> -> S0#?MODULE{epin = 1, epout = 2};
-                <<0:1, _/bitstring>> -> S0#?MODULE{epin = 2, epout = 1}
+                <<_, 0:2, _/bitstring>> ->
+                    S0#?MODULE{epin = 1, epout = 2, epint = 3};
+                <<_, 1:2, _/bitstring>> ->
+                    S0#?MODULE{epin = 2, epout = 1, epint = 3};
+                <<_, 2:2, _/bitstring>> ->
+                    S0#?MODULE{epin = 2, epout = 2, epint = 1};
+                <<_, 3:2, _/bitstring>> ->
+                    S0#?MODULE{epin = 1, epout = 1, epint = 2}
             end,
-            {ok, start_slots(S1)};
+            <<_:5, NSlots0:3, _/bitstring>> = crypto:hash(sha256, Name),
+            NSlots = lists:min([NSlots0 + 2, 5]),
+            {ok, start_slots(NSlots - 1, S1#?MODULE{nslots = NSlots})};
         {error, already_registered} ->
             {stop, already_registered};
         {error, Why} ->
             {stop, {register_failed, Why}}
     end.
 
-start_slots(S0 = #?MODULE{name = Name}) ->
-    {ok, Slot0} = ccid_slot_fsm:start_link(Name, 0, self()),
-    {ok, Slot1} = ccid_slot_fsm:start_link(Name, 1, self()),
-    S0#?MODULE{slots = #{0 => Slot0, 1 => Slot1}}.
+start_slots(-1, S0 = #?MODULE{}) -> S0;
+start_slots(N, S0 = #?MODULE{name = Name, slots = Slots0}) ->
+    {ok, Slot} = ccid_slot_fsm:start_link(Name, N, self()),
+    Slots1 = Slots0#{N => Slot},
+    start_slots(N - 1, S0#?MODULE{slots = Slots1}).
 
 terminate(_Why, #?MODULE{}) ->
     ok.
@@ -208,7 +222,8 @@ handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name, slots = Slots0}) -
                     rslot = undefined,
                     rseq = undefined,
                     rwait = false,
-                    iwait = false},
+                    iwait = false,
+                    iq = []},
     gen_server:reply(From, #urelay_status{errno = 0}),
     {noreply, S1};
 
@@ -234,8 +249,9 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                     ]),
                     {ctrl_reply_data(X, D0), S0};
                 ?UDESC_CONFIG ->
-                    #?MODULE{epin = EpIn, epout = EpOut, epint = _EpInt} = S0,
-                    Eps = [{EpIn, in}, {EpOut, out}],%, {EpInt, int}],
+                    #?MODULE{epin = EpIn, epout = EpOut, epint = EpInt,
+                             nslots = NSlots} = S0,
+                    Eps = [{EpIn, in}, {EpOut, out}, {EpInt, int}],
                     EpDescrs = lists:map(fun
                         ({N, in}) ->
                             #usb_endpoint_descr{
@@ -255,8 +271,8 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                             #usb_endpoint_descr{
                                 bEndpointAddress = {in, N},
                                 bmAttributes = interrupt,
-                                wMaxPacketSize = 16,
-                                bInterval = 255
+                                wMaxPacketSize = 8,
+                                bInterval = 32
                             }
                     end, lists:sort(Eps)),
                     D0 = udescr:pack([
@@ -270,7 +286,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                         #usb_intf_descr{
                             bInterfaceNumber = 0,
                             bAlternateSetting = 0,
-                            bNumEndpoints = 2,
+                            bNumEndpoints = length(EpDescrs),
                             bInterfaceClass = 16#0B,
                             bInterfaceSubClass = 16#00,
                             bInterfaceProtocol = 16#00,
@@ -278,7 +294,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                         },
                         #usb_ccid_descr{
                             bcdCCID = {1, 10},
-                            bMaxSlotIndex = 1,
+                            bMaxSlotIndex = NSlots - 1,
                             bVoltageSupport = ['5v', '3v', '1.8v'],
                             dwProtocols = [t1, t0],
                             dwDefaultClock = 3580,
@@ -297,7 +313,7 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                             bClassEnvelope = 16#FF,
                             wLcdLayout = none,
                             bPINSupport = [],
-                            bMaxCCIDBusySlots = 2
+                            bMaxCCIDBusySlots = NSlots
                         }
                     ] ++ EpDescrs),
                     {ctrl_reply_data(X, D0), S0};
@@ -369,7 +385,10 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                                rslot = undefined,
                                rseq = undefined,
                                rbuf = <<>>,
-                               rpos = 0}
+                               rpos = 0};
+                {{in, IntEp}, #?MODULE{epint = IntEp}} ->
+                    % clearing a stall on intr-in
+                    S0#?MODULE{iq = []}
             end,
             {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
 
@@ -410,9 +429,11 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                     {ctrl_reply(X, ?USB_ERR_STALLED), S0}
             end;
         {?UT_READ_CLASS_INTERFACE, ?CCID_CTRL_GET_CLOCK} ->
+            lager:debug("[~s] reading clock speeds", [Name]),
             Data = <<3580:32/little>>,
             {ctrl_reply_data(X, Data), S0};
         {?UT_READ_CLASS_INTERFACE, ?CCID_CTRL_GET_BAUD} ->
+            lager:debug("[~s] reading baud rates", [Name]),
             Data = <<9600:32/little, 115200:32/little>>,
             {ctrl_reply_data(X, Data), S0};
 
@@ -513,12 +534,33 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
     {noreply, S1};
 
 handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIntr}, From,
-                                            S0 = #?MODULE{epint = EpIntr}) ->
+                                    S0 = #?MODULE{epint = EpIntr, iq = []}) ->
     #urelay_data{remain = Rem} = X,
     Resp = #urelay_data_resp{blen = Rem,
                              errcode = ?USB_NAK,
                              rc = ?USB_ERR_CANCELLED},
     S1 = S0#?MODULE{iwait = true},
+    gen_statem:reply(From, Resp),
+    {noreply, S1};
+handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIntr}, From,
+                                    S0 = #?MODULE{epint = EpIntr, iq = IQ0}) ->
+    #urelay_data{remain = Rem} = X,
+    [Buf | IQ1] = IQ0,
+    ActualRem = byte_size(Buf),
+    {RC, EC, Chunk} = if
+        (Rem > ActualRem) ->
+            {?USB_ERR_SHORT_XFER, ?USB_SHORT,
+             binary:part(Buf, {0, ActualRem})};
+        (ActualRem >= Rem) ->
+            {?USB_ERR_NORMAL_COMPLETION, ?USB_ACK,
+             binary:part(Buf, {0, Rem})}
+    end,
+    Resp = #urelay_data_resp{rc = RC,
+                             errcode = EC,
+                             bdone = byte_size(Chunk),
+                             blen = Rem - byte_size(Chunk),
+                             data = Chunk},
+    S1 = S0#?MODULE{iq = IQ1},
     gen_statem:reply(From, Resp),
     {noreply, S1};
 
@@ -571,8 +613,48 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
             {noreply, S0}
     end.
 
+handle_cast({slot_presence, Fsm, Slot, Pres},
+                            S0 = #?MODULE{slots = Slots0, slast = Last0}) ->
+    #?MODULE{name = Name} = S0,
+    #{Slot := Fsm} = Slots0,
+    case maps:get(Slot, Last0, not_present) of
+        Pres ->
+            {noreply, S0};
+        _ ->
+            lager:debug("[~s/~B] changing to ~p", [Name, Slot, Pres]),
+            M0 = maps:map(fun (SlotNum, _) ->
+                {maps:get(SlotNum, Last0, not_present), no_change}
+            end, Slots0),
+            M1 = M0#{Slot => {Pres, change}},
+            Intr = #ccid_rdr_to_pc_notifyslotchange{slots = M1},
+            lager:debug("[~s/~B] INTR << ~s",
+                [Name, Slot, ccid:pretty_print(Intr)]),
+            Last1 = Last0#{Slot => Pres},
+            S1 = S0#?MODULE{slast = Last1},
+            S2 = send_intr(Intr, S1),
+            {noreply, S2}
+    end;
+
 handle_cast(_, #?MODULE{}) ->
     error(no_cast).
+
+send_intr(Msg, S0 = #?MODULE{name = Name, epint = EpInt,
+                             iwait = Waiting, iq = []}) ->
+    Bin = ccid:encode_intr(Msg),
+    S1 = if
+        Waiting ->
+            #?MODULE{conn_fsm = Fsm, reqs = Reqs0} = S0,
+            lager:debug("[~s] sending intr for intr-in", [Name]),
+            Cmd = #urelay_intr{dir = ?URELAY_DIR_IN, ep = EpInt},
+            Reqs1 = gen_statem:send_request(Fsm, Cmd, intr, Reqs0),
+            S0#?MODULE{reqs = Reqs1};
+        true ->
+            S0
+    end,
+    S1#?MODULE{iq = [Bin], iwait = false};
+send_intr(Msg, S0 = #?MODULE{iq = IQ0}) ->
+    Bin = ccid:encode_intr(Msg),
+    S0#?MODULE{iq = IQ0 ++ [Bin]}.
 
 send_bulk_resp(Msg, S0 = #?MODULE{rbuf = <<>>, rq = [], name = Name,
                                   epin = EpIn, rwait = Waiting}) ->
