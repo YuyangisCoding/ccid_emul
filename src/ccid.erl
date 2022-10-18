@@ -32,7 +32,7 @@
 
 -export([pretty_print/1, pretty_print/2]).
 
--export([decode_msg/1, encode_msg/1, error_resp/2]).
+-export([decode_msg/1, encode_msg/1, error_resp/2, slot_seq/1]).
 
 -export_type([
     msg/0, host_msg/0, device_msg/0
@@ -337,6 +337,28 @@ uncollect_bits(Set, [Atom | Rest]) ->
         false -> [0 | uncollect_bits(Set, Rest)]
     end;
 uncollect_bits(_Set, []) -> [].
+
+slot_seq(#ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_resetparams{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_escape{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_iccclock{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_t0apdu{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_secure{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_mechanical{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_abort{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_setbaudclock{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_generic_msg{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_rdr_to_pc_params{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_rdr_to_pc_escape{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_rdr_to_pc_baudclock{slot = Slot, seq = Seq}) -> {Slot, Seq};
+slot_seq(#ccid_pc_to_rdr_secure{slot = Slot, seq = Seq}) -> {Slot, Seq}.
 
 error_resp(#ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
            #ccid_err{} = Err) ->

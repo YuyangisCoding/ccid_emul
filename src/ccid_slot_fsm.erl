@@ -52,7 +52,8 @@
     empty/3,
     pwr_off/3,
     pwr_on/3,
-    wait_abort/3
+    wait_abort/3,
+    busy/3
     %mute/3
     ]).
 
@@ -87,6 +88,10 @@ config_err(Pid, Scenario, PErr, Types) ->
     last_cmd :: undefined | ccid:host_msg(),
     aborter :: undefined | gen_statem:from(),
     abort_to :: undefined | atom(),
+    abort_seq :: undefined | integer(),
+    idle_to :: undefined | atom(),
+    card_req :: undefined | gen_statem:request_id(),
+    waiter :: undefined | gen_statem:from(),
     card :: pid(),
     cmref :: reference(),
     err = #{} :: err_config()
@@ -144,6 +149,100 @@ inject_err(Scenario, AllowTypes, #?MODULE{err = E, name = Name, slotidx = Slot})
             ok
     end.
 
+cancel_waiter(S0 = #?MODULE{card_req = undefined}) ->
+    S0;
+cancel_waiter(S0 = #?MODULE{idle_to = PrevState, last_cmd = X, waiter = From}) ->
+    IccState = case PrevState of
+        pwr_off -> inactive;
+        pwr_on -> active;
+        _ -> not_present
+    end,
+    Reply = ccid:error_resp(X, #ccid_err{icc = IccState,
+                                         cmd = failed,
+                                         error = ?CCID_CMD_ABORTED}),
+    gen_statem:reply(From, Reply),
+    S0#?MODULE{card_req = undefined, waiter = undefined}.
+
+busy(enter, PrevState, S0 = #?MODULE{idle_to = undefined}) ->
+    {keep_state, S0#?MODULE{idle_to = PrevState}};
+busy(enter, _PrevState, #?MODULE{}) ->
+    keep_state_and_data;
+
+busy(info, {'DOWN', MRef, process, Card, _Why},
+                                    S0 = #?MODULE{card = Card, cmref = MRef}) ->
+    #?MODULE{name = Name, slotidx = SlotIdx} = S0,
+    {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
+    NewMRef = erlang:monitor(process, NewCard),
+    ok = gen_statem:call(Card, reset),
+    {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
+busy(info, _Msg, #?MODULE{card_req = undefined}) ->
+    keep_state_and_data;
+busy(info, Msg, S0 = #?MODULE{card_req = ReqId, waiter = From}) ->
+    case gen_statem:check_response(Msg, ReqId) of
+        {reply, RAPDU = #apdu_reply{}} ->
+            #?MODULE{name = Name, slotidx = Slot, last_cmd = X} = S0,
+            #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq} = X,
+            lager:debug("[~s/~B] APDU << ~s", [Name, Slot,
+                ccid:pretty_print(RAPDU)]),
+            RepData = iso7816:encode_apdu_reply(RAPDU),
+            Resp = #ccid_rdr_to_pc_datablock{slot = Slot,
+                                             seq = Seq,
+                                             data = RepData},
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{card_req = undefined, waiter = undefined}};
+        no_reply ->
+            keep_state_and_data
+    end;
+
+busy({call, From}, {finish_read, Seq}, S0 = #?MODULE{last_cmd = Cmd,
+                                                     name = Name,
+                                                     slotidx = Slot}) ->
+    case ccid:slot_seq(Cmd) of
+        {Slot, Seq} ->
+            #?MODULE{idle_to = PrevState} = S0,
+            gen_statem:reply(From, ok),
+            {next_state, PrevState, S0#?MODULE{idle_to = undefined}};
+        {Slot, OtherSeq} ->
+            lager:debug("[~s/~B] finish read on other seq: ~B (expected ~B)",
+                [Name, Slot, Seq, OtherSeq]),
+            gen_statem:reply(From, ok),
+            keep_state_and_data
+    end;
+
+busy({call, From}, stall_clear, S0 = #?MODULE{idle_to = PrevState}) ->
+    gen_statem:reply(From, ok),
+    S1 = cancel_waiter(S0#?MODULE{idle_to = undefined}),
+    {next_state, PrevState, S1};
+
+busy({call, From}, reset, S0 = #?MODULE{card = Card, idle_to = NewState}) ->
+    ok = gen_statem:call(Card, reset),
+    gen_statem:reply(From, ok),
+    S1 = cancel_waiter(S0#?MODULE{idle_to = undefined}),
+    {next_state, NewState, S1};
+busy({call, From}, {abort, Seq}, S0 = #?MODULE{idle_to = NewState}) ->
+    gen_statem:reply(From, ok),
+    S1 = cancel_waiter(S0#?MODULE{idle_to = undefined}),
+    {next_state, wait_abort, S1#?MODULE{abort_seq = Seq,
+                                        abort_to = NewState}};
+busy({call, _From}, Cmd, S0 = #?MODULE{}) when is_atom(Cmd) ->
+    {keep_state, S0, [postpone]};
+busy({call, _From}, {config_err, _, _}, S0 = #?MODULE{}) ->
+    {keep_state, S0, [postpone]};
+busy({call, From}, Cmd, S0 = #?MODULE{idle_to = RetState}) ->
+    IccState = case RetState of
+        pwr_off -> inactive;
+        pwr_on -> active;
+        _ -> not_present
+    end,
+    #?MODULE{name = Name, slotidx = Slot} = S0,
+    lager:debug("[~s/~B] new command while busy!", [Name, Slot]),
+    Resp = ccid:error_resp(Cmd, #ccid_err{icc = IccState,
+                                          cmd = failed,
+                                          error = ?CCID_CMD_SLOT_BUSY}),
+    gen_statem:reply(From, Resp),
+    % don't update last_cmd, we use that!
+    {keep_state, S0}.
+
 empty(enter, _PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] empty", [Name, Slot]),
     {keep_state, S0};
@@ -156,6 +255,15 @@ empty(info, {'DOWN', MRef, process, Card, _Why},
     ok = gen_statem:call(Card, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
+empty(info, _, #?MODULE{}) ->
+    keep_state_and_data;
+
+empty({call, From}, {finish_read, _Seq}, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
+empty({call, From}, stall_clear, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
 empty({call, From}, reset, #?MODULE{card = Card}) ->
     ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
@@ -172,18 +280,17 @@ empty({call, From}, {config_err, Scenario, Config}, S0 = #?MODULE{err = E0}) ->
     gen_statem:reply(From, ok),
     {keep_state, S0#?MODULE{err = E1}};
 
-empty({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
-                                    aborter = AbortFrom}) ->
+empty({call, From}, {abort, Seq}, #?MODULE{last_cmd = #ccid_pc_to_rdr_abort{seq = Seq},
+                                           aborter = AbortFrom, slotidx = Slot}) ->
     gen_statem:reply(From, ok),
-    #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq} = A,
     Msg = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
-                                      err = #ccid_err{icc = not_present},
-                                      clock = stopped},
+                                     err = #ccid_err{icc = not_present},
+                                     clock = stopped},
     gen_statem:reply(AbortFrom, Msg),
     keep_state_and_data;
-empty({call, From}, abort, S0 = #?MODULE{}) ->
+empty({call, From}, {abort, Seq}, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
-    {next_state, wait_abort, S0};
+    {next_state, wait_abort, S0#?MODULE{abort_seq = Seq}};
 empty({call, From}, X = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{}) ->
     {keep_state, S0#?MODULE{last_cmd = X, aborter = From}};
 
@@ -193,27 +300,27 @@ empty({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                       err = #ccid_err{icc = not_present},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 empty({call, From}, Cmd = #ccid_pc_to_rdr_xfrblock{}, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                           cmd = failed,
                                           error = ?CCID_ICC_MUTE}),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}};
 empty({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweron{}, S0 = #?MODULE{}) ->
     timer:sleep(1000),
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                           cmd = failed,
                                           error = ?CCID_ICC_MUTE}),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}};
 empty({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
                                       err = #ccid_err{icc = not_present},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}};
 
 empty({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -221,14 +328,14 @@ empty({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                   err = #ccid_err{icc = not_present},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 empty({call, From}, X = #ccid_pc_to_rdr_resetparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
                                   err = #ccid_err{icc = not_present},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 empty({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
@@ -237,14 +344,14 @@ empty({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                   error = 10},
                                   params = none},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 
 empty({call, From}, Cmd, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                           cmd = failed,
                                           error = ?CCID_CMD_UNSUPPORTED}),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}}.
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}}.
 
 
 pwr_off(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
@@ -258,6 +365,8 @@ pwr_off(info, {'DOWN', MRef, process, Card, _Why},
     NewMRef = erlang:monitor(process, NewCard),
     ok = gen_statem:call(Card, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
+pwr_off(info, _, #?MODULE{}) ->
+    keep_state_and_data;
 
 pwr_off({call, From}, reset, #?MODULE{card = Card}) ->
     ok = gen_statem:call(Card, reset),
@@ -274,21 +383,26 @@ pwr_off({call, From}, {config_err, Scenario, Config}, S0 = #?MODULE{err = E0}) -
     E1 = E0#{Scenario => Config},
     gen_statem:reply(From, ok),
     {keep_state, S0#?MODULE{err = E1}};
+pwr_off({call, From}, {finish_read, _Seq}, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
+pwr_off({call, From}, stall_clear, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
 
-pwr_off({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
-                                      aborter = AbortFrom,
-                                      name = Name, slotidx = Slot}) ->
+pwr_off({call, From}, {abort, Seq}, #?MODULE{last_cmd = #ccid_pc_to_rdr_abort{seq = Seq},
+                                             aborter = AbortFrom,
+                                             name = Name, slotidx = Slot}) ->
     gen_statem:reply(From, ok),
     lager:debug("[~s/~B] using stashed abort cmd", [Name, Slot]),
-    #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq} = A,
     Msg = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
-                                      err = #ccid_err{icc = inactive},
-                                      clock = stopped},
+                                     err = #ccid_err{icc = inactive},
+                                     clock = stopped},
     gen_statem:reply(AbortFrom, Msg),
     keep_state_and_data;
-pwr_off({call, From}, abort, S0 = #?MODULE{}) ->
+pwr_off({call, From}, {abort, Seq}, S0 = #?MODULE{}) ->
     gen_statem:reply(From, ok),
-    {next_state, wait_abort, S0};
+    {next_state, wait_abort, S0#?MODULE{abort_seq = Seq}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{}) ->
     #?MODULE{name = Name, slotidx = Slot} = S0,
     lager:debug("[~s/~B] stashing abort cmd", [Name, Slot]),
@@ -300,21 +414,21 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                       err = #ccid_err{icc = inactive},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_xfrblock{data = <<>>},
                                 S0 = #?MODULE{name = Name, slotidx = Slot}) ->
     Resp = ccid:error_resp(X, #ccid_err{icc = active, cmd = failed,
                                         error = ?CCID_LENGTH_INVALID}),
     lager:debug("[~s/~B] sent zero-length xfrblock", [Name, Slot]),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_xfrblock{}, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = inactive,
                                           cmd = failed,
                                           error = ?CCID_ICC_MUTE}),
     timer:sleep(500),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                     S0 = #?MODULE{card = C}) ->
     case inject_err(power_on, [long_sleep, hw_error, parity], S0) of
@@ -324,27 +438,27 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                   cmd = failed,
                                                   error = ?CCID_ICC_MUTE}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         {error, hw_error} ->
             timer:sleep(100),
             Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
                                                   cmd = failed,
                                                   error = ?CCID_HW_ERROR}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         {error, parity} ->
             timer:sleep(500),
             Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
                                                   cmd = failed,
                                                   error = ?CCID_XFR_PARITY_ERR}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         ok ->
             {ok, ATR} = gen_statem:call(C, get_atr),
             Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
             timer:sleep(500),
             gen_statem:reply(From, Resp),
-            {next_state, pwr_on, S0#?MODULE{last_cmd = X}}
+            {next_state, busy, S0#?MODULE{last_cmd = X, idle_to = pwr_on}}
     end;
 pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -352,7 +466,7 @@ pwr_off({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                       err = #ccid_err{icc = inactive},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}};
 
 pwr_off({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -360,14 +474,14 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                   err = #ccid_err{icc = inactive},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_resetparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
                                   err = #ccid_err{icc = inactive},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_off({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
@@ -376,38 +490,63 @@ pwr_off({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                   error = 10},
                                   params = none},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 
 pwr_off({call, From}, Cmd, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = inactive,
                                           cmd = failed,
                                           error = ?CCID_CMD_UNSUPPORTED}),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}}.
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd}}.
 
-wait_abort(enter, PrevState, S0 = #?MODULE{name = Name, slotidx = Slot}) ->
-    lager:debug("[~s/~B] awaiting abort cmd", [Name, Slot]),
+wait_abort(enter, PrevState, S0 = #?MODULE{name = Name, slotidx = Slot,
+                                           abort_to = undefined}) ->
+    lager:debug("[~s/~B] awaiting abort cmd (return to ~p)", [Name, Slot,
+        PrevState]),
     {keep_state, S0#?MODULE{abort_to = PrevState}};
+wait_abort(enter, PrevState, #?MODULE{name = Name, slotidx = Slot,
+                                      abort_to = FinalState}) ->
+    lager:debug("[~s/~B] awaiting abort cmd (return to ~p, from ~p)",
+        [Name, Slot, FinalState, PrevState]),
+    keep_state_and_data;
 wait_abort({call, From}, reset, S0 = #?MODULE{abort_to = State, card = Card}) ->
     ok = gen_statem:call(Card, reset),
     gen_statem:reply(From, ok),
-    {next_state, State, S0};
-wait_abort({call, _From}, _Other, #?MODULE{}) ->
+    {next_state, State, S0#?MODULE{abort_to = undefined}};
+wait_abort({call, From}, stall_clear, #?MODULE{}) ->
+    gen_statem:reply(From, ok),
+    keep_state_and_data;
+wait_abort({call, _From}, Cmd, #?MODULE{}) when is_atom(Cmd) ->
     {keep_state_and_data, [postpone]};
+wait_abort({call, _From}, {config_err, _, _}, #?MODULE{}) ->
+    {keep_state_and_data, [postpone]};
+wait_abort({call, From}, {abort, NewSeq}, S0 = #?MODULE{name = Name,
+                                                        slotidx = Slot}) ->
+    gen_statem:reply(From, ok),
+    lager:debug("[~s/~B] aborting to seq ~B now instead", [Name, Slot, NewSeq]),
+    {keep_state, S0#?MODULE{abort_seq = NewSeq}};
 wait_abort({call, From}, X = #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq},
-                                            S0 = #?MODULE{abort_to = State}) ->
-    % XXX: the state should decide what err and clock we put here?
+                                            S0 = #?MODULE{abort_to = State,
+                                                          abort_seq = Seq}) ->
+    {IccState, Clock} = case State of
+        pwr_off -> {inactive, stopped};
+        pwr_on -> {active, running};
+        _ -> {not_present, stopped}
+    end,
     Msg = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
-                                     err = #ccid_err{icc = inactive},
-                                     clock = stopped},
+                                     err = #ccid_err{icc = IccState},
+                                     clock = Clock},
     gen_statem:reply(From, Msg),
-    {next_state, State, S0#?MODULE{last_cmd = X}};
+    S1 = S0#?MODULE{last_cmd = X, abort_to = undefined, idle_to = State},
+    {next_state, busy, S1};
 wait_abort({call, From}, Cmd, S0 = #?MODULE{}) ->
     Resp = ccid:error_resp(Cmd, #ccid_err{icc = inactive,
                                           cmd = failed,
                                           error = ?CCID_CMD_ABORTED}),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = Cmd}}.
+    {keep_state, S0#?MODULE{last_cmd = Cmd}};
+wait_abort(info, _Msg, #?MODULE{}) ->
+    {keep_state_and_data, [postpone]}.
 
 pwr_on(enter, _PrevState, #?MODULE{name = Name, slotidx = Slot}) ->
     lager:debug("[~s/~B] powered on", [Name, Slot]),
@@ -418,10 +557,9 @@ pwr_on({call, From}, reset, S0 = #?MODULE{card = Card}) ->
     gen_statem:reply(From, ok),
     {next_state, pwr_off, S0};
 
-pwr_on({call, From}, abort, #?MODULE{last_cmd = A = #ccid_pc_to_rdr_abort{},
-                                     aborter = AbortFrom}) ->
+pwr_on({call, From}, {abort, Seq}, #?MODULE{last_cmd = #ccid_pc_to_rdr_abort{seq = Seq},
+                                            aborter = AbortFrom, slotidx = Slot}) ->
     gen_statem:reply(From, ok),
-    #ccid_pc_to_rdr_abort{slot = Slot, seq = Seq} = A,
     Msg = #ccid_rdr_to_pc_slotstatus{slot = Slot, seq = Seq,
                                       err = #ccid_err{icc = active},
                                       clock = running},
@@ -444,7 +582,7 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
                                       err = #ccid_err{icc = active},
                                       clock = running},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 
 pwr_on({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
@@ -452,14 +590,14 @@ pwr_on({call, From}, Cmd = #ccid_pc_to_rdr_iccpoweroff{slot = Slot, seq = Seq},
                                       err = #ccid_err{icc = inactive},
                                       clock = stopped},
     gen_statem:reply(From, Resp),
-    {next_state, pwr_off, S0#?MODULE{last_cmd = Cmd}};
+    {next_state, busy, S0#?MODULE{last_cmd = Cmd, idle_to = pwr_off}};
 pwr_on({call, From}, X = #ccid_pc_to_rdr_iccpoweron{slot = Slot, seq = Seq},
                                                     S0 = #?MODULE{card = C}) ->
     {ok, ATR} = gen_statem:call(C, get_atr),
     ok = gen_statem:call(C, reset),
     Resp = #ccid_rdr_to_pc_datablock{slot = Slot, seq = Seq, data = ATR},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{data = <<>>},
                                 S0 = #?MODULE{name = Name, slotidx = Slot}) ->
@@ -467,7 +605,7 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{data = <<>>},
                                         error = ?CCID_LENGTH_INVALID}),
     lager:debug("[~s/~B] sent zero-length xfrblock", [Name, Slot]),
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
                         S0 = #?MODULE{name = Name, slotidx = Slot, card = C}) ->
@@ -480,48 +618,51 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_xfrblock{slot = Slot, seq = Seq},
                                                 cmd = failed,
                                                 error = ?CCID_ICC_MUTE}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         {error, hw_error} ->
             timer:sleep(100),
             Resp = ccid:error_resp(X, #ccid_err{icc = active,
                                                 cmd = failed,
                                                 error = ?CCID_HW_ERROR}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         {error, parity} ->
             timer:sleep(100),
             Resp = ccid:error_resp(X, #ccid_err{icc = active,
                                                 cmd = failed,
                                                 error = ?CCID_XFR_PARITY_ERR}),
             gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X}};
         {error, ripped} ->
             timer:sleep(500),
             Resp = ccid:error_resp(X, #ccid_err{icc = inactive,
                                                 cmd = failed,
                                                 error = ?CCID_ICC_MUTE}),
             gen_statem:reply(From, Resp),
-            {next_state, empty, S0#?MODULE{last_cmd = X}};
+            {next_state, busy, S0#?MODULE{last_cmd = X, idle_to = empty}};
         ok ->
             APDU = iso7816:decode_apdu_cmd(APDUData),
             lager:debug("[~s/~B] APDU >> ~s", [Name, Slot,
                 ccid:pretty_print(APDU)]),
-            RAPDU = case APDU of
+            case APDU of
                 #apdu_cmd{} ->
-                    gen_statem:call(C, APDU);
+                    ReqId = gen_statem:send_request(C, APDU),
+                    {next_state, busy, S0#?MODULE{last_cmd = X,
+                                                  card_req = ReqId,
+                                                  waiter = From}};
                 {error, Why} ->
                     lager:debug("apdu decode failed: ~p", [Why]),
-                    #apdu_reply{sw = {error, general_failure}}
-            end,
-            lager:debug("[~s/~B] APDU << ~s", [Name, Slot,
-                ccid:pretty_print(RAPDU)]),
-            RepData = iso7816:encode_apdu_reply(RAPDU),
-            Resp = #ccid_rdr_to_pc_datablock{slot = Slot,
-                                             seq = Seq,
-                                             data = RepData},
-            timer:sleep(5 + byte_size(RepData) div 4),
-            gen_statem:reply(From, Resp),
-            {keep_state, S0#?MODULE{last_cmd = X}}
+                    RAPDU = #apdu_reply{sw = {error, general_failure}},
+                    lager:debug("[~s/~B] APDU << ~s", [Name, Slot,
+                        ccid:pretty_print(RAPDU)]),
+                    RepData = iso7816:encode_apdu_reply(RAPDU),
+                    Resp = #ccid_rdr_to_pc_datablock{slot = Slot,
+                                                     seq = Seq,
+                                                     data = RepData},
+                    timer:sleep(5 + byte_size(RepData) div 4),
+                    gen_statem:reply(From, Resp),
+                    {next_state, busy, S0#?MODULE{last_cmd = X}}
+            end
     end;
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
@@ -530,14 +671,14 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_getparams{slot = Slot, seq = Seq},
                                   err = #ccid_err{icc = active},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_on({call, From}, X = #ccid_pc_to_rdr_resetparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
                                   err = #ccid_err{icc = active},
                                   params = #ccid_t0_params{}},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
 pwr_on({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                             S0 = #?MODULE{}) ->
     Resp = #ccid_rdr_to_pc_params{slot = Slot, seq = Seq,
@@ -546,7 +687,11 @@ pwr_on({call, From}, X = #ccid_pc_to_rdr_setparams{slot = Slot, seq = Seq},
                                                   error = 10},
                                   params = none},
     gen_statem:reply(From, Resp),
-    {keep_state, S0#?MODULE{last_cmd = X}};
+    {next_state, busy, S0#?MODULE{last_cmd = X}};
+
+pwr_on(info, Msg, S0 = #?MODULE{}) ->
+    % fall through to pwr_off handling
+    pwr_off(info, Msg, S0);
 
 pwr_on({call, From}, X, S0 = #?MODULE{}) ->
     % fall through to pwr_off handling

@@ -89,12 +89,12 @@ force_reset(Pid) ->
         Other -> Other
     end.
 
--type slotstate() :: idle | busy | waiting.
 -type slot() :: integer().
+-type seq() :: integer().
 
 -record(?MODULE, {
     name :: string(),
-    slots :: #{slot() => {pid(), slotstate()}},
+    slots :: #{slot() => pid()},
     reqs = gen_statem:reqids_new() :: gen_statem:request_id_collection(),
     conn_fsm :: undefined | pid(),
     mref :: undefined | reference(),
@@ -116,8 +116,9 @@ force_reset(Pid) ->
     cmdbuf = [] :: [binary()],
 
     % bulk-in buffer (responses to host)
-    rq = [] :: [{slot(), binary()}],
+    rq = [] :: [{slot(), seq(), binary()}],
     rslot = undefined :: undefined | slot(),
+    rseq = undefined :: undefined | seq(),
     rbuf = <<>> :: binary(),
     rpos = 0 :: integer(),
 
@@ -160,7 +161,7 @@ init([Name]) ->
 
 start_slots(S0 = #?MODULE{name = Name}) ->
     {ok, Slot0} = ccid_slot_fsm:start_link(Name, 0, self()),
-    S0#?MODULE{slots = #{0 => {Slot0, idle}}}.
+    S0#?MODULE{slots = #{0 => Slot0}}.
 
 terminate(_Why, #?MODULE{}) ->
     ok.
@@ -187,24 +188,24 @@ ctrl_reply_data(#urelay_ctrl{length = Len}, Data) ->
 
 handle_call({get_slot, N}, _From, S0 = #?MODULE{slots = Slots}) ->
     case Slots of
-        #{N := {Pid, _}} -> {reply, {ok, Pid}, S0};
+        #{N := Pid} -> {reply, {ok, Pid}, S0};
         _ -> {reply, {error, not_found}, S0}
     end;
 
 handle_call(#urelay_reset{}, From, S0 = #?MODULE{name = Name, slots = Slots0}) ->
     lager:debug("[~s] reset", [Name]),
-    Slots1 = maps:map(fun (_Number, {Pid, _SlotState}) ->
+    maps:foreach(fun (_Number, Pid) ->
         ok = gen_statem:call(Pid, reset),
         {Pid, idle}
     end, Slots0),
     S1 = S0#?MODULE{reqs = gen_statem:reqids_new(),
-                    slots = Slots1,
                     cmdlen = undefined,
                     cmdbuf = [],
                     rq = [],
                     rbuf = <<>>,
                     rpos = 0,
                     rslot = undefined,
+                    rseq = undefined,
                     rwait = false,
                     iwait = false},
     gen_server:reply(From, #urelay_status{errno = 0}),
@@ -360,15 +361,14 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                 {{in, InEp}, #?MODULE{epin = InEp, slots = Slots0}} ->
                     % clearing a stall on bulk-in
                     % drop all queued messages on the floor?
-                    Slots1 = maps:map(fun
-                        (_Slot, {Fsm, busy}) -> {Fsm, busy};
-                        (_Slot, {Fsm, _}) -> {Fsm, idle}
+                    maps:foreach(fun (_SlotNum, Pid) ->
+                        ok = gen_statem:call(Pid, stall_clear)
                     end, Slots0),
                     S0#?MODULE{rq = [],
                                rslot = undefined,
+                               rseq = undefined,
                                rbuf = <<>>,
-                               rpos = 0,
-                               slots = Slots1}
+                               rpos = 0}
             end,
             {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
 
@@ -394,35 +394,18 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
 
         {?UT_WRITE_CLASS_INTERFACE, ?CCID_CTRL_ABORT} ->
             Slot = Val band 16#FF,
-            #?MODULE{slots = Slots0, rq = RQ0} = S0,
+            AbortSeq = (Val bsr 8) band 16#FF,
+            #?MODULE{slots = Slots0} = S0,
             case Slots0 of
-                #{Slot := {Fsm, idle}} ->
-                    lager:debug("[~s] ABORT: idle slot ~B, doing nothing",
-                        [Name, Slot]),
-                    ok = gen_statem:call(Fsm, abort),
-                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
-                #{Slot := {Fsm, _}} ->
-                    lager:debug("[~s] ABORT: busy slot ~B!", [Name, Slot]),
-                    ok = gen_statem:call(Fsm, abort),
-                    SS1 = case S0 of
-                        #?MODULE{rslot = Slot} ->
-                            lager:debug("[~s] ABORT: killing current resp",
-                                [Name]),
-                            S0#?MODULE{rbuf = <<>>, rpos = 0, rslot = undefined};
-                        _ ->
-                            S0
-                    end,
-                    RQ1 = lists:filter(fun
-                        ({TheSlot, _Bin}) when (TheSlot =:= Slot) ->
-                            lager:debug("[~s] ABORT: killing queued resp",
-                                [Name]),
-                            false;
-                        ({_OtherSlot, _Bin}) ->
-                            true
-                    end, RQ0),
-                    SS2 = SS1#?MODULE{rq = RQ1},
-                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS2};
+                #{Slot := Fsm} ->
+                    lager:debug("[~s] ABORT: slot ~B, seq ~B",
+                        [Name, Slot, AbortSeq]),
+                    ok = gen_statem:call(Fsm, {abort, AbortSeq}),
+                    SS1 = drop_slot_resps(Slot, S0),
+                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
                 _ ->
+                    lager:debug("[~s] abort non-existent slot ~B",
+                        [Name, Slot]),
                     {ctrl_reply(X, ?USB_ERR_STALLED), S0}
             end;
         {?UT_READ_CLASS_INTERFACE, ?CCID_CTRL_GET_CLOCK} ->
@@ -483,8 +466,8 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
 handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
                                     S0 = #?MODULE{rbuf = <<>>, rq = RQ0,
                                                   epin = EpIn}) ->
-    [{Slot, Next} | RQ1] = RQ0,
-    S1 = S0#?MODULE{rbuf = Next, rpos = 0, rq = RQ1, rslot = Slot},
+    [{Slot, Seq, Next} | RQ1] = RQ0,
+    S1 = S0#?MODULE{rbuf = Next, rpos = 0, rq = RQ1, rslot = Slot, rseq = Seq},
     handle_call(X, From, S1);
 
 handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
@@ -507,27 +490,18 @@ handle_call(X = #urelay_data{dir = ?URELAY_DIR_IN, ep = EpIn}, From,
     Pos1 = Pos0 + byte_size(Chunk),
     S1 = if
         (Pos1 >= byte_size(Buf)) ->
-            #?MODULE{rslot = RSlot, slots = Slots0, rq = RQ} = S0,
+            #?MODULE{rslot = RSlot, rseq = Seq, slots = Slots0} = S0,
             case maps:get(RSlot, Slots0, none) of
-                {Fsm, waiting} ->
-                    % we should only ever be reading from a waiting slot
-                    % check if there are any more responses for this slot
-                    % queued up (there might be if they're SLOT_BUSY errors or
-                    % abort resps)
-                    MoreResps = lists:any(fun
-                        ({QSlot, _}) when (QSlot == RSlot) -> true;
-                        (_) -> false
-                    end, RQ),
-                    % if there are none, this slot is now idle
-                    Slots1 = case MoreResps of
-                        false -> Slots0#{RSlot => {Fsm, idle}};
-                        true -> Slots0
-                    end,
-                    S0#?MODULE{rpos = 0, rbuf = <<>>, rslot = undefined,
-                               slots = Slots1};
                 none ->
                     % this should be an INVALID_SLOT response
-                    S0#?MODULE{rpos = 0, rbuf = <<>>, rslot = undefined}
+                    #?MODULE{name = Name} = S0,
+                    lager:debug("[~s] read from a non-existent slot??", [Name]),
+                    S0#?MODULE{rpos = 0, rbuf = <<>>, rseq = undefined,
+                               rslot = undefined};
+                Fsm ->
+                    ok = gen_statem:call(Fsm, {finish_read, Seq}),
+                    S0#?MODULE{rpos = 0, rbuf = <<>>, rslot = undefined,
+                               rseq = undefined}
             end;
         true ->
             S0#?MODULE{rpos = Pos1}
@@ -584,11 +558,12 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
             {noreply, S0#?MODULE{reqs = Reqs1}};
         {{reply, Resp}, Slot, Reqs1} ->
             #?MODULE{name = Name} = S0,
+            {Slot, _Seq} = ccid:slot_seq(Resp),
             lager:debug("[~s/~B] << ~s", [Name, Slot, ccid:pretty_print(Resp)]),
-            #{Slot := {Fsm, busy}} = Slots0,
-            Slots1 = Slots0#{Slot => {Fsm, waiting}},
-            S1 = S0#?MODULE{reqs = Reqs1, slots = Slots1},
-            {noreply, send_bulk_resp(Slot, Resp, S1)};
+            #{Slot := Fsm} = Slots0,
+            true = is_pid(Fsm),
+            S1 = S0#?MODULE{reqs = Reqs1},
+            {noreply, send_bulk_resp(Resp, S1)};
         _ ->
             {noreply, S0}
     end.
@@ -596,8 +571,9 @@ handle_info(Msg, S0 = #?MODULE{reqs = Reqs0, slots = Slots0}) ->
 handle_cast(_, #?MODULE{}) ->
     error(no_cast).
 
-send_bulk_resp(Slot, Msg, S0 = #?MODULE{rbuf = <<>>, rq = [], name = Name,
+send_bulk_resp(Msg, S0 = #?MODULE{rbuf = <<>>, rq = [], name = Name,
                                   epin = EpIn, rwait = Waiting}) ->
+    {Slot, Seq} = ccid:slot_seq(Msg),
     Bin = ccid:encode_msg(Msg),
     S1 = if
         Waiting ->
@@ -609,47 +585,41 @@ send_bulk_resp(Slot, Msg, S0 = #?MODULE{rbuf = <<>>, rq = [], name = Name,
         true ->
             S0
     end,
-    S1#?MODULE{rbuf = Bin, rpos = 0, rwait = false, rslot = Slot};
-send_bulk_resp(Slot, Msg, S0 = #?MODULE{rq = RQ0}) ->
+    S1#?MODULE{rbuf = Bin, rpos = 0, rwait = false, rslot = Slot, rseq = Seq};
+send_bulk_resp(Msg, S0 = #?MODULE{rq = RQ0}) ->
+    {Slot, Seq} = ccid:slot_seq(Msg),
     Bin = ccid:encode_msg(Msg),
-    S0#?MODULE{rq = RQ0 ++ [{Slot, Bin}]}.
+    S0#?MODULE{rq = RQ0 ++ [{Slot, Seq, Bin}]}.
 
-handle_cmd(Slot, Cmd = #ccid_pc_to_rdr_abort{}, S0 = #?MODULE{slots = Slots0,
-                                                              reqs = Reqs0,
-                                                              name = Name}) ->
-    lager:debug("[~s/~B] !>>! ~s", [Name, Slot, ccid:pretty_print(Cmd)]),
-    case Slots0 of
-        #{Slot := {Fsm, _}} ->
-            Reqs1 = gen_statem:send_request(Fsm, Cmd, Slot, Reqs0),
-            Slots1 = Slots0#{Slot => {Fsm, busy}},
-            S0#?MODULE{reqs = Reqs1, slots = Slots1};
-        _ ->
-            lager:debug("[~s/~B] dropping, invalid slot num", [Name, Slot]),
-            Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
-                                                  cmd = failed,
-                                                  error = ?CCID_SLOT_INVALID}),
-            send_bulk_resp(Slot, Resp, S0)
-    end;
-handle_cmd(Slot, Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
-                                    name = Name}) ->
+drop_slot_resps(Slot, S0 = #?MODULE{name = Name, rq = RQ0}) ->
+    S1 = case S0 of
+        #?MODULE{rslot = Slot, rpos = 0} ->
+            S0#?MODULE{rslot = undefined, rseq = undefined, rbuf = <<>>};
+        _ -> S0
+    end,
+    RQ1 = lists:filter(fun
+        ({TheSlot, _Bin}) when (TheSlot =:= Slot) ->
+            lager:debug("[~s] ABORT: killing queued resp", [Name]),
+            false;
+        ({_OtherSlot, _Bin}) ->
+            true
+    end, RQ0),
+    S1#?MODULE{rq = RQ1}.
+
+handle_cmd(Cmd, S0 = #?MODULE{slots = Slots0, reqs = Reqs0,
+                              name = Name}) ->
+    {Slot, _Seq} = ccid:slot_seq(Cmd),
     lager:debug("[~s/~B] >> ~s", [Name, Slot, ccid:pretty_print(Cmd)]),
     case Slots0 of
-        #{Slot := {Fsm, idle}} ->
+        #{Slot := Fsm} ->
             Reqs1 = gen_statem:send_request(Fsm, Cmd, Slot, Reqs0),
-            Slots1 = Slots0#{Slot => {Fsm, busy}},
-            S0#?MODULE{reqs = Reqs1, slots = Slots1};
-        #{Slot := {_Fsm, _}} ->
-            lager:debug("[~s/~B] dropping, slot busy", [Name, Slot]),
-            Resp = ccid:error_resp(Cmd, #ccid_err{icc = active,
-                                                  cmd = failed,
-                                                  error = ?CCID_CMD_SLOT_BUSY}),
-            send_bulk_resp(Slot, Resp, S0);
+            S0#?MODULE{reqs = Reqs1};
         _ ->
             lager:debug("[~s/~B] dropping, invalid slot num", [Name, Slot]),
             Resp = ccid:error_resp(Cmd, #ccid_err{icc = not_present,
                                                   cmd = failed,
                                                   error = ?CCID_SLOT_INVALID}),
-            send_bulk_resp(Slot, Resp, S0)
+            send_bulk_resp(Resp, S0)
     end.
 
 check_cmd(S0 = #?MODULE{cmdlen = undefined}) -> S0;
@@ -671,15 +641,14 @@ check_cmd(S0 = #?MODULE{cmdbuf = Buf, cmdlen = Len, seq = Seq0, name = Name}) ->
             end,
             case ccid:decode_msg(Cmd) of
                 {ok, Rec} ->
-                    Slot = element(2, Rec),
-                    Seq = element(3, Rec),
+                    {_Slot, Seq} = ccid:slot_seq(Rec),
                     if
                         (Seq < Seq0) ->
                             lager:debug("[~s] sequence number reset!", [Name]);
                         true -> ok
                     end,
                     S2 = S1#?MODULE{seq = Seq},
-                    check_cmd(handle_cmd(Slot, Rec, S2));
+                    check_cmd(handle_cmd(Rec, S2));
                 Err ->
                     lager:debug("[~s] failed to decode ccid command ~p: ~p", [
                         Name, Cmd, Err]),
