@@ -179,12 +179,34 @@ busy(state_timeout, time_ext, #?MODULE{sup = Sup, last_cmd = X,
     {keep_state_and_data, [{state_timeout, 4000, time_ext}]};
 
 busy(info, {'DOWN', MRef, process, Card, _Why},
-                                    S0 = #?MODULE{card = Card, cmref = MRef}) ->
+                                    S0 = #?MODULE{card = Card, cmref = MRef,
+                                                  card_req = undefined}) ->
     #?MODULE{name = Name, slotidx = SlotIdx} = S0,
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
-    ok = gen_statem:call(Card, reset),
+    ok = gen_statem:call(NewCard, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
+busy(info, {'DOWN', MRef, process, Card, _Why},
+                                    S0 = #?MODULE{card = Card, cmref = MRef,
+                                                  waiter = From, last_cmd = X,
+                                                  idle_to = RetState}) ->
+    #?MODULE{name = Name, slotidx = SlotIdx} = S0,
+    {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
+    NewMRef = erlang:monitor(process, NewCard),
+    ok = gen_statem:call(NewCard, reset),
+    S1 = S0#?MODULE{card = NewCard, cmref = NewMRef},
+    IccState = case RetState of
+        pwr_off -> inactive;
+        pwr_on -> active;
+        _ -> not_present
+    end,
+    #?MODULE{name = Name, slotidx = Slot} = S0,
+    lager:debug("[~s/~B] killed command due to card crash", [Name, Slot]),
+    Resp = ccid:error_resp(X, #ccid_err{icc = IccState,
+                                        cmd = failed,
+                                        error = ?CCID_ICC_MUTE}),
+    gen_statem:reply(From, Resp),
+    {keep_state, S1};
 busy(info, _Msg, #?MODULE{card_req = undefined}) ->
     keep_state_and_data;
 busy(info, Msg, S0 = #?MODULE{card_req = ReqId, waiter = From}) ->
@@ -264,7 +286,7 @@ empty(info, {'DOWN', MRef, process, Card, _Why},
     #?MODULE{name = Name, slotidx = SlotIdx} = S0,
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
-    ok = gen_statem:call(Card, reset),
+    ok = gen_statem:call(NewCard, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
 empty(info, _, #?MODULE{}) ->
@@ -376,7 +398,7 @@ pwr_off(info, {'DOWN', MRef, process, Card, _Why},
     #?MODULE{name = Name, slotidx = SlotIdx} = S0,
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
-    ok = gen_statem:call(Card, reset),
+    ok = gen_statem:call(NewCard, reset),
     {keep_state, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 pwr_off(info, _, #?MODULE{}) ->
     keep_state_and_data;
@@ -586,7 +608,7 @@ pwr_on(info, {'DOWN', MRef, process, Card, _Why},
     {ok, NewCard} = ccid_card_fsm:open(Name, SlotIdx),
     NewMRef = erlang:monitor(process, NewCard),
     % treat this as a card hardware error I guess?
-    ok = gen_statem:call(Card, reset),
+    ok = gen_statem:call(NewCard, reset),
     {next_state, pwr_off, S0#?MODULE{card = NewCard, cmref = NewMRef}};
 
 pwr_on({call, From}, X = #ccid_pc_to_rdr_getslotstatus{slot = Slot, seq = Seq},
