@@ -249,9 +249,9 @@ piv({call, From},
     {Reply, S1} = case Tags of
         #{tag := <<16#5F, 16#C1, 16#02>>} ->
             {#apdu_reply{sw = {error, {denied, incompat_file}}}, S0};
-        #{tag := File, data := Data} ->
+        #{tag := File, data := FileData} ->
             #?MODULE{files = F0} = S0,
-            F1 = F0#{File => Data},
+            F1 = F0#{File => FileData},
             {#apdu_reply{sw = ok}, S0#?MODULE{files = F1}}
     end,
     gen_statem:reply(From, Reply),
