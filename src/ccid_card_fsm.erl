@@ -117,7 +117,7 @@ open(Name, SlotIdx) ->
     sup :: pid(),
     name :: string(),
     slotidx :: integer(),
-    files :: #{binary() => binary()}
+    files = #{} :: #{binary() => binary()}
     }).
 
 -define(pp(Rec),

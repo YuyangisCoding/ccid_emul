@@ -222,6 +222,15 @@ busy(info, Msg, S0 = #?MODULE{card_req = ReqId, waiter = From}) ->
                                              data = RepData},
             gen_statem:reply(From, Resp),
             {keep_state, S0#?MODULE{card_req = undefined, waiter = undefined}};
+        {error, Err} ->
+            #?MODULE{name = Name, slotidx = Slot, last_cmd = X} = S0,
+            lager:debug("[~s/~B] error from card: ~p", [Name, Slot, Err]),
+            Resp = ccid:error_resp(X,
+                #ccid_err{icc = active,
+                          cmd = failed,
+                          error = ?CCID_ICC_MUTE}),
+            gen_statem:reply(From, Resp),
+            {keep_state, S0#?MODULE{card_req = undefined, waiter = undefined}};
         no_reply ->
             keep_state_and_data
     end;
