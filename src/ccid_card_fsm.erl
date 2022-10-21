@@ -228,8 +228,8 @@ piv({call, From},
         #{tag := File} ->
             #?MODULE{files = F0} = S0,
             case F0 of
-                #{File := Data} ->
-                    OutTags = #{data => Data},
+                #{File := FileData} ->
+                    OutTags = #{data => FileData},
                     OutData = iso7816:encode_ber_tlvs_map(OutTags,
                         ?PIV_GETDATA_INVTAGMAP),
                     #apdu_reply{data = OutData};
