@@ -369,28 +369,38 @@ handle_call(X = #urelay_ctrl{}, From, S0 = #?MODULE{name = Name}) ->
                 <<1:1, 0:3, Num:4>> -> {in, Num}
             end,
             lager:debug("[~s] clearing stall on ~p", [Name, EpAddr]),
-            SS1 = case {EpAddr, S0} of
-                {control, _} -> S0;
+            case {EpAddr, S0} of
+                {control, _} ->
+                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), S0};
                 {{out, OutEp}, #?MODULE{epout = OutEp}} ->
                     % clearing a stall on the bulk-out
                     % we'll drop all our command buffers
-                    S0#?MODULE{cmdlen = undefined, cmdbuf = []};
+                    SS1 = S0#?MODULE{cmdlen = undefined, cmdbuf = []},
+                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
                 {{in, InEp}, #?MODULE{epin = InEp, slots = Slots0}} ->
                     % clearing a stall on bulk-in
                     % drop all queued messages on the floor?
                     maps:foreach(fun (_SlotNum, Pid) ->
                         ok = gen_statem:call(Pid, stall_clear)
                     end, Slots0),
-                    S0#?MODULE{rq = [],
-                               rslot = undefined,
-                               rseq = undefined,
-                               rbuf = <<>>,
-                               rpos = 0};
+                    SS1 = S0#?MODULE{rq = [],
+                                     rslot = undefined,
+                                     rseq = undefined,
+                                     rbuf = <<>>,
+                                     rpos = 0},
+                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
                 {{in, IntEp}, #?MODULE{epint = IntEp}} ->
                     % clearing a stall on intr-in
-                    S0#?MODULE{iq = []}
-            end,
-            {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
+                    SS1 = S0#?MODULE{iq = []},
+                    {ctrl_reply(X, ?USB_ERR_NORMAL_COMPLETION), SS1};
+                _ ->
+                    % what
+                    lager:debug("[~s] unknown endpoint for stall clear "
+                        "(in/out/int = ~B/~B/~B)", [Name, S0#?MODULE.epin,
+                        S0#?MODULE.epout, S0#?MODULE.epint]),
+                    {ctrl_reply(X, ?USB_ERR_STALLED), S0}
+            end;
+
 
         {?UT_WRITE_DEVICE, ?UR_SET_CONFIG} ->
             lager:debug("[~s] set config ~B", [Name, Val]),
